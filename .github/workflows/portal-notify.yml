@@ -1,0 +1,6 @@
+あなたのリポジトリ/
+├── portal_notify.py
+├── seen.json              # 中身は空の [] でOK
+└── .github/
+    └── workflows/
+        └── portal-notify.yml   ← 出力したymlをリネームしてここに置く
