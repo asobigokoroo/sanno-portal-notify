@@ -35,7 +35,7 @@ jobs:
           SANNO_ID: ${{ secrets.SANNO_ID }}
           SANNO_PASS: ${{ secrets.SANNO_PASS }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          DEBUG: "0"
+          DEBUG: "1"
         run: python portal_notify.py
 
       - name: Commit seen.json
