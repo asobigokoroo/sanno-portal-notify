@@ -1,40 +1,53 @@
 #!/usr/bin/env python3
 """
-sanno-portal-notify  (CA-in / CampusWeb 新着を Discord に通知)
+sanno-portal-notify v3  (産業能率大学ポータル / CampusWeb お知らせ → Discord)
 
-GitHub Actions の cron から呼ばれる前提のスクリプトやで。
-- 産能ポータルに Playwright(Chromium) でログイン
-- トップ(top.do)の「CA-in」ニュースをスクレイピング
-- 未通知のモノだけ Discord Webhook に投げる（seen.json で重複防止）
+■ 重要（v3の変更点）
+  ログイン画面(signweb)の「ユーザー名/パスワード/ログイン/キャンセル」ダイアログは
+  Chrome ネイティブの【HTTP Basic 認証】ダイアログや。
+  これはHTMLフォームやないから page.fill() では触れへん。
+  → browser.new_context(http_credentials=...) で認証を通す。これが本命。
+  （保険としてHTMLフォーム方式のフォールバックも残してある）
 
-環境変数（GitHub Secrets に入れる）:
-  SANNO_ID            : 学籍番号/ログインID
-  SANNO_PASS          : パスワード
-  DISCORD_WEBHOOK     : Discord Webhook URL
-  LOGIN_URL           : ログインページ (default: https://signweb.mi.sanno.ac.jp/portal/)
-  PORTAL_TOP_URL      : default: https://portal-xs.mi.sanno.ac.jp/campusweb/top.do
-  SEEN_FILE           : default: seen.json
-  DEBUG               : "1" で失敗時にHTML/スクショを debug/ に保存
+  top.do の「お知らせ」テーブル（タイトル / 受信日時 / 送信者 / 種別 / NEW）を
+  解析して、新着だけ Discord に投げる。
+
+環境変数（GitHub Secrets）:
+  SANNO_ID          : ログインID（ユーザー名）
+  SANNO_PASS        : パスワード
+  DISCORD_WEBHOOK   : Discord Webhook URL
+  LOGIN_URL         : default https://signweb.mi.sanno.ac.jp/portal/
+  PORTAL_TOP_URL    : default https://portal-xs.mi.sanno.ac.jp/campusweb/top.do
+  FILTER_KEYWORD    : タイトルに含まれる語で絞る（例: 【情マネ】）。空なら全部。
+  MAX_ITEMS_PER_RUN : 1回の通知上限（default 5）
+  SEEN_FILE         : default seen.json
+  DEBUG             : "1" で失敗時のHTML/スクショを debug/ に保存
 """
 
 import os
 import sys
 import json
+import re
 import time
 import urllib.request
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urljoin
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 LOGIN_URL = os.environ.get("LOGIN_URL", "https://signweb.mi.sanno.ac.jp/portal/")
 PORTAL_TOP_URL = os.environ.get("PORTAL_TOP_URL", "https://portal-xs.mi.sanno.ac.jp/campusweb/top.do")
+PORTAL_BASE = "https://portal-xs.mi.sanno.ac.jp"
 SEEN_FILE = os.environ.get("SEEN_FILE", "seen.json")
 SANNO_ID = os.environ.get("SANNO_ID", "")
 SANNO_PASS = os.environ.get("SANNO_PASS", "")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
+FILTER_KEYWORD = os.environ.get("FILTER_KEYWORD", "")
+MAX_ITEMS = int(os.environ.get("MAX_ITEMS_PER_RUN", "5"))
 DEBUG = os.environ.get("DEBUG", "") == "1"
 
 JST = timezone(timedelta(hours=9))
+DATE_RE = re.compile(r"\d{4}/\d{2}/\d{2}\s*\d{2}:\d{2}")
 
 
 def log(*a):
@@ -52,7 +65,6 @@ def load_seen():
 
 
 def save_seen(seen):
-    # 古いものを捨てて直近400件だけ残す
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(list(seen))[-400:], f, ensure_ascii=False, indent=2)
 
@@ -64,7 +76,7 @@ def post_discord(content):
     payload = json.dumps({"username": "SANNO Portal", "content": content[:1900]}).encode("utf-8")
     req = urllib.request.Request(
         DISCORD_WEBHOOK, data=payload,
-        headers={"Content-Type": "application/json", "User-Agent": "sanno-notify/1.0"},
+        headers={"Content-Type": "application/json", "User-Agent": "sanno-notify/3.0"},
         method="POST",
     )
     try:
@@ -72,80 +84,6 @@ def post_discord(content):
             log("discord status", r.status)
     except Exception as e:
         log("discord post failed:", e)
-
-
-def try_fill(page, selectors, value):
-    for sel in selectors:
-        try:
-            el = page.query_selector(sel)
-            if el:
-                el.fill(value)
-                log("filled", sel)
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def try_click(page, selectors):
-    for sel in selectors:
-        try:
-            el = page.query_selector(sel)
-            if el:
-                el.click()
-                log("clicked", sel)
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def scrape_news(page):
-    """CA-in のニュースらしき項目を拾う。セレクタは複数候補を試す。"""
-    items = []
-    seen_keys = set()
-
-    # よくある「ニュース/お知らせ」領域の候補セレクタ
-    containers = [
-        "#cain-news", ".cain-news", "[class*='cain']",
-        "[class*='news']", "[class*='information']", "[class*='info']",
-        "[id*='news']", "[id*='information']",
-    ]
-    scope = None
-    for c in containers:
-        el = page.query_selector(c)
-        if el:
-            scope = el
-            log("news container:", c)
-            break
-
-    root = scope or page
-    anchors = root.query_selector_all("a")
-
-    for a in anchors:
-        try:
-            text = (a.inner_text() or "").strip().replace("\n", " ")
-            href = a.get_attribute("href") or ""
-            if not text or len(text) < 4:
-                continue
-            # ナビ系リンクを雑に除外
-            if text in ("ログアウト", "トップ", "戻る", "ホーム"):
-                continue
-            if href.startswith("javascript:") or href == "#":
-                continue
-            key = text[:120]
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            items.append({"text": text[:200], "href": href})
-        except Exception:
-            continue
-
-    # 領域が見つからん時は、ページ全体から「日付っぽい行」の近くを拾う保険
-    if not items and scope is None:
-        log("ニュース領域が特定できへん。ページ全体から拾う（要セレクタ調整）")
-
-    return items[:30]
 
 
 def dump_debug(page, name):
@@ -161,95 +99,183 @@ def dump_debug(page, name):
         log("debug dump failed:", e)
 
 
+def html_form_login(page):
+    """（保険）もしHTMLフォームのログインやったら埋める"""
+    for sel in ["input[name='username']", "input[id='username']", "input[name='userid']",
+                "input[name='userId']", "input[name='j_username']", "input[name='loginId']"]:
+        el = page.query_selector(sel)
+        if el and el.is_visible():
+            el.fill(SANNO_ID)
+            pw = page.query_selector("input[type='password']")
+            if pw:
+                pw.fill(SANNO_PASS)
+            for b in ["button:has-text('ログイン')", "input[type='submit']", "button[type='submit']"]:
+                try:
+                    be = page.query_selector(b)
+                    if be and be.is_visible():
+                        be.click()
+                        log("html form login submitted")
+                        return True
+                except Exception:
+                    continue
+    return False
+
+
+def scrape_news(page):
+    """top.do のお知らせ一覧テーブルを解析"""
+    items = []
+    try:
+        page.wait_for_selector("table", timeout=30000)
+    except PWTimeout:
+        log("table が見つからん")
+
+    for tr in page.query_selector_all("tr"):
+        try:
+            a = tr.query_selector("td a")
+            if not a:
+                continue
+            title = re.sub(r"\s+", " ", (a.inner_text() or "")).strip()
+            if len(title) < 4:
+                continue
+
+            tds = tr.query_selector_all("td")
+            texts = [re.sub(r"\s+", " ", (td.inner_text() or "")).strip() for td in tds]
+
+            date, idx = "", -1
+            for j, t in enumerate(texts):
+                m = DATE_RE.search(t)
+                if m:
+                    date, idx = m.group(0), j
+                    break
+            sender, kind = "", ""
+            if idx >= 0:
+                rest = [t for t in texts[idx + 1:] if t]
+                if rest:
+                    sender = rest[0]
+                if len(rest) > 1:
+                    kind = rest[-1]
+
+            href = a.get_attribute("href") or ""
+            if href.startswith("http"):
+                url = href
+            elif href.startswith("/"):
+                url = urljoin(PORTAL_BASE, href)
+            else:
+                url = urljoin(PORTAL_TOP_URL, href)
+
+            is_new = "NEW" in (tr.inner_text() or "")
+            items.append({"title": title, "date": date, "sender": sender,
+                          "kind": kind, "url": url, "new": is_new})
+        except Exception:
+            continue
+
+    out, seen_titles = [], set()
+    for it in items:
+        if it["title"] in seen_titles:
+            continue
+        seen_titles.add(it["title"])
+        out.append(it)
+    return out[:30]
+
+
 def main():
     if not SANNO_ID or not SANNO_PASS:
         log("SANNO_ID / SANNO_PASS が未設定やで。")
         sys.exit(1)
 
     seen = load_seen()
-    new_items = []
+    first_run = len(seen) == 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context(
             locale="ja-JP",
+            viewport={"width": 1600, "height": 1000},
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/124.0.0.0 Safari/537.36"),
+            # ★ここが本命：HTTP Basic 認証のネイティブダイアログを自動で突破する
+            http_credentials={"username": SANNO_ID, "password": SANNO_PASS},
         )
         page = ctx.new_page()
 
-        log("open login page")
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-        time.sleep(2)
-
-        # ログインフォーム（name/id の候補を広めに）
-        ok_id = try_fill(page, [
-            "input[name='username']", "input[id='username']",
-            "input[name='userId']", "input[name='j_username']",
-            "input[name='loginId']", "input[name='userid']",
-            "input[type='text']",
-        ], SANNO_ID)
-        ok_pw = try_fill(page, [
-            "input[name='password']", "input[id='password']",
-            "input[name='j_password']", "input[name='passwd']",
-            "input[type='password']",
-        ], SANNO_PASS)
-
-        if not (ok_id and ok_pw):
-            log("ログインフォームのセレクタが見つからんかった。DEBUG=1 で HTML を見て調整してな。")
-            dump_debug(page, "login")
-            browser.close()
-            sys.exit(2)
-
-        try_click(page, [
-            "button[type='submit']", "input[type='submit']",
-            "#loginButton", "#login_button", ".login-btn",
-            "button:has-text('ログイン')", "input[value*='ログイン']",
-            "input[value*='ログオン']", "a:has-text('ログイン')",
-        ])
-
+        log("open portal top (Basic認証つき):", PORTAL_TOP_URL)
+        try:
+            page.goto(PORTAL_TOP_URL, wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            log("goto failed:", e)
         try:
             page.wait_for_load_state("networkidle", timeout=30000)
         except PWTimeout:
             pass
         time.sleep(3)
-
         log("current url:", page.url)
-        dump_debug(page, "after_login")
 
-        # ポータルトップへ
-        log("open portal top")
-        page.goto(PORTAL_TOP_URL, wait_until="domcontentloaded", timeout=60000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=30000)
-        except PWTimeout:
-            pass
-        time.sleep(2)
+        # Basic認証で通ってへん場合の保険：ログインページ経由＋HTMLフォーム
+        if "signweb" in page.url or "login" in page.url.lower():
+            log("Basic認証で通らんかった。ログインページ経由を試す")
+            try:
+                page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(2)
+                html_form_login(page)
+                try:
+                    page.wait_for_url(lambda u: "signweb" not in u, timeout=45000)
+                except PWTimeout:
+                    pass
+                page.goto(PORTAL_TOP_URL, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(3)
+            except Exception as e:
+                log("fallback login failed:", e)
+
+        if "signweb" in page.url:
+            log("ログイン突破できんかった。DEBUG=1 でHTMLを見せて。")
+            dump_debug(page, "login_fail")
+            browser.close()
+            sys.exit(2)
+
         dump_debug(page, "portal_top")
-
         items = scrape_news(page)
-        log("scraped", len(items), "items")
-
-        for it in items:
-            key = "portal|" + str(abs(hash(it["text"])))
-            if key in seen:
-                continue
-            seen.add(key)
-            new_items.append(it)
-
+        log("scraped:", len(items))
         browser.close()
+
+    if FILTER_KEYWORD:
+        before = len(items)
+        items = [it for it in items if FILTER_KEYWORD in it["title"]]
+        log("filter '%s': %d -> %d" % (FILTER_KEYWORD, before, len(items)))
+
+    new_items = []
+    for it in items:
+        key = it["title"] + "|" + it["date"]
+        if key in seen:
+            continue
+        seen.add(key)
+        new_items.append(it)
+
+    if first_run:
+        save_seen(seen)
+        post_discord("✅ **産業能率大学ポータル監視** を開始したで。\n"
+                     "今後ここにお知らせの新着を流すわ。（基準登録: " + str(len(items)) + "件）")
+        log("first run baseline saved:", len(seen))
+        return
 
     if not new_items:
         log("新着なし。")
         return
 
-    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
-    lines = [f"📢 **SANNOポータル 新着 {len(new_items)}件** ({now})", ""]
-    for it in new_items[:15]:
-        lines.append("・" + it["text"][:120])
-    body = "\n".join(lines)
-    post_discord(body)
+    for it in new_items[:MAX_ITEMS]:
+        lines = ["📢 **産能ポータル新着" + ("（NEW未読）" if it["new"] else "") + "**"]
+        lines.append("[**" + it["title"][:150] + "**](" + it["url"] + ")")
+        if it["date"]:
+            lines.append("🕐 受信: `" + it["date"] + "`")
+        if it["sender"]:
+            lines.append("👤 送信者: " + it["sender"][:40])
+        if it["kind"]:
+            lines.append("🏷️ 種別: " + it["kind"][:20])
+        post_discord("\n".join(lines))
+        time.sleep(1)
+
+    if len(new_items) > MAX_ITEMS:
+        post_discord("…ほか " + str(len(new_items) - MAX_ITEMS) + " 件の新着あり")
 
     save_seen(seen)
     log("done. new:", len(new_items))
