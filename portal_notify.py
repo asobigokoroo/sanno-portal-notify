@@ -1,108 +1,98 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v4
-- Basic認証ダイアログ自動突破
-- お知らせのURLリンク抽出＆Discord Embed化（クリックで直飛び）
-- 複数サーバー通知対応（Discord複数 / Slack / LINE / 汎用Webhook）
+sanno-portal-notify v6
+- 新着お知らせだけを通知（過去分の一覧は送らない）
+- 1件＝1メッセージで個別にポスト（タイトルはクリックでポータルへ）
+- 複数サーバー対応（Discord複数 / Slack / 汎用Webhook）
+- Basic認証自動突破 / iframe全走査 / DEBUG=1で調査ログ
 """
 
 import os
-import sys
-import json
 import re
+import json
+import sys
 import urllib.request
 from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 
-# 設定
 PORTAL_TOP = "https://portal-xs.mi.sanno.ac.jp/campusweb/top.do"
 SEEN_FILE = "seen.json"
+DEBUG = os.environ.get("DEBUG", "0") == "1"
 
 SANNO_ID = os.environ.get("SANNO_ID", "").strip()
 SANNO_PASS = os.environ.get("SANNO_PASS", "").strip()
 DISCORD_WEBHOOKS = [w.strip() for w in os.environ.get("DISCORD_WEBHOOK", "").split(",") if w.strip()]
-SLACK_WEBHOOKS = [w.strip() for w in os.environ.get("SLACK_WEBHOOK", "").split(",") if w.strip()]
+SLACK_WEBHOOKS   = [w.strip() for w in os.environ.get("SLACK_WEBHOOK", "").split(",") if w.strip()]
 GENERIC_WEBHOOKS = [w.strip() for w in os.environ.get("GENERIC_WEBHOOK", "").split(",") if w.strip()]
-
 FILTER_KEYWORD = os.environ.get("FILTER_KEYWORD", "").strip()
-MAX_ITEMS = int(os.environ.get("MAX_ITEMS_PER_RUN", "5"))
-DEBUG = os.environ.get("DEBUG", "0") == "1"
+MAX_NOTIFY = int(os.environ.get("MAX_NOTIFY_PER_RUN", "20"))
+
+NOISE = ["ログアウト", "メニュー", "パスワード変更", "サイトマップ", "ホーム", "戻る",
+         "在学生", "保護者", "教職員", "ログイン", "ヘルプ", "English"]
 
 
 def post_json(url, payload):
     req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
+        url, data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "User-Agent": "sanno-portal-notify"},
-        method="POST"
-    )
+        method="POST")
     with urllib.request.urlopen(req, timeout=15) as r:
         return r.status
 
 
-def broadcast_message(text):
-    """プレーンテキストを全サーバーへ送信（開始通知など）"""
+def send_discord_embed(item):
+    embed = {
+        "title": (item["title"][:240] or "(無題)"),
+        "url": item.get("url") or PORTAL_TOP,
+        "color": 0x1E88E5,
+    }
+    if item.get("meta"):
+        embed["description"] = item["meta"][:400]
+    embed["footer"] = {"text": "産業能率大学ポータル 新着"}
     for wh in DISCORD_WEBHOOKS:
         try:
-            post_json(wh, {"content": text})
+            st = post_json(wh, {"embeds": [embed]})
+            print(f"[portal-notify] discord 1件送信 (status {st})")
         except Exception as e:
-            print(f"[warn] discord send failed: {e}")
+            print(f"[warn] discord failed: {e}")
+
+
+def send_slack_item(item):
+    url = item.get("url") or PORTAL_TOP
+    text = f"📢 *新着* <{url}|{item['title']}>"
+    if item.get("meta"):
+        text += f"\n>{item['meta']}"
     for wh in SLACK_WEBHOOKS:
         try:
-            post_json(wh, {"text": text})
+            st = post_json(wh, {"text": text})
+            print(f"[portal-notify] slack 1件送信 (status {st})")
         except Exception as e:
-            print(f"[warn] slack send failed: {e}")
+            print(f"[warn] slack failed: {e}")
 
 
-def broadcast_items(new_items):
-    """URLリンク付きのお知らせを全サーバーへ送信"""
-    # 1. Discord 向け（EmbedでタイトルがURLリンクになる！）
-    if DISCORD_WEBHOOKS:
-        embeds = []
-        for it in new_items[:10]:
-            e = {
-                "title": (it["title"][:240] or "(無題)"),
-                "url": it.get("url") or PORTAL_TOP,   # ← タイトルを押すと直で飛べる！
-                "description": it.get("meta", "")[:400],
-                "color": 0x1E88E5  # 綺麗なブルー
-            }
-            embeds.append(e)
+def send_generic_item(item):
+    payload = {"source": "sanno-portal-notify", "count": 1, "items": [item]}
+    for wh in GENERIC_WEBHOOKS:
+        try:
+            post_json(wh, payload)
+        except Exception as e:
+            print(f"[warn] generic failed: {e}")
 
-        payload = {
-            "content": f"📢 **産業能率大学ポータル 新着お知らせ ({len(new_items)}件)**",
-            "embeds": embeds
-        }
-        for wh in DISCORD_WEBHOOKS:
-            try:
-                st = post_json(wh, payload)
-                print(f"[portal-notify] discord sent to ...{wh[-10:]} (status {st})")
-            except Exception as e:
-                print(f"[warn] discord send failed: {e}")
 
-    # 2. Slack 向け（<URL|タイトル> 形式でリンク化）
-    if SLACK_WEBHOOKS:
-        lines = [f"📢 *産業能率大学ポータル 新着お知らせ ({len(new_items)}件)*\n"]
-        for it in new_items[:10]:
-            url = it.get("url") or PORTAL_TOP
-            meta = f" ({it['meta']})" if it.get("meta") else ""
-            lines.append(f"・<{url}|{it['title']}>{meta}")
-        slack_payload = {"text": "\n".join(lines)}
-        for wh in SLACK_WEBHOOKS:
-            try:
-                st = post_json(wh, slack_payload)
-                print(f"[portal-notify] slack sent (status {st})")
-            except Exception as e:
-                print(f"[warn] slack send failed: {e}")
+def broadcast_item(item):
+    if DISCORD_WEBHOOKS: send_discord_embed(item)
+    if SLACK_WEBHOOKS:   send_slack_item(item)
+    if GENERIC_WEBHOOKS: send_generic_item(item)
 
-    # 3. 汎用Webhook（JSONまるごと送信）
-    if GENERIC_WEBHOOKS:
-        payload = {"source": "sanno-portal-notify", "count": len(new_items), "items": new_items}
-        for wh in GENERIC_WEBHOOKS:
-            try:
-                post_json(wh, payload)
-            except Exception as e:
-                print(f"[warn] generic webhook failed: {e}")
+
+def broadcast_message(text):
+    for wh in DISCORD_WEBHOOKS:
+        try: post_json(wh, {"content": text})
+        except Exception as e: print(f"[warn] discord failed: {e}")
+    for wh in SLACK_WEBHOOKS:
+        try: post_json(wh, {"text": text})
+        except Exception as e: print(f"[warn] slack failed: {e}")
 
 
 def load_seen():
@@ -110,128 +100,135 @@ def load_seen():
         return set()
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return set(data if isinstance(data, list) else [])
+            d = json.load(f)
+            return set(d if isinstance(d, list) else [])
     except Exception:
         return set()
 
 
 def save_seen(seen):
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(list(seen))[-1000:], f, ensure_ascii=False, indent=2)
+        json.dump(sorted(list(seen))[-2000:], f, ensure_ascii=False, indent=2)
+
+
+def dump_debug(page):
+    os.makedirs("debug", exist_ok=True)
+    all_links = []
+    for i, frame in enumerate(page.frames):
+        try:
+            html = frame.content()
+        except Exception as e:
+            html = f"(取得失敗: {e})"
+        with open(f"debug/frame_{i}.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        try:
+            for a in frame.query_selector_all("a"):
+                href = a.get_attribute("href") or ""
+                txt = (a.inner_text() or "").strip().replace("\n", " ")
+                if href and not href.startswith("javascript"):
+                    all_links.append({"frame": i, "text": txt[:80], "href": href})
+        except Exception:
+            pass
+    with open("debug/links.json", "w", encoding="utf-8") as f:
+        json.dump(all_links, f, ensure_ascii=False, indent=2)
+    try:
+        page.screenshot(path="debug/screenshot.png", full_page=True)
+    except Exception:
+        pass
+    print(f"[portal-notify][DEBUG] frames={len(page.frames)} links={len(all_links)} → debug/ 保存")
+
+
+def looks_like_date(s):
+    return re.match(r"^\s*(\d{4}[/年]\d{1,2}[/月]\d{1,2}日?|\d{1,2}/\d{1,2}|NEW|新着)", s) is not None
 
 
 def scrape_portal():
     if not SANNO_ID or not SANNO_PASS:
-        print("[error] SANNO_ID / SANNO_PASS が設定されてへん")
-        sys.exit(1)
+        print("[error] SANNO_ID / SANNO_PASS 未設定"); sys.exit(1)
 
     items = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        # Basic認証をダイアログが出る前に自動突破
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             http_credentials={"username": SANNO_ID, "password": SANNO_PASS},
-            viewport={"width": 1280, "height": 900}
-        )
+            viewport={"width": 1400, "height": 1000})
         page = context.new_page()
-
-        print("[portal-notify] open portal top (with Basic Auth)...")
+        print("[portal-notify] open portal top (Basic Auth)...")
         page.goto(PORTAL_TOP, wait_until="networkidle", timeout=45000)
         print(f"[portal-notify] current url: {page.url}")
-
         if "signweb" in page.url:
-            print("[error] Basic認証が突破できてへん。ID/PASSを確認してな。")
-            sys.exit(2)
+            print("[error] Basic認証突破できず。ID/PASSを確認してな。"); sys.exit(2)
+        page.wait_for_timeout(4000)
 
-        page.wait_for_timeout(3000)
+        if DEBUG:
+            dump_debug(page)
 
-        # お知らせ一覧の要素とURLリンクを取得
-        # top.do のテーブル行またはリンクを探索
-        rows = page.query_selector_all("table tr, .information-item, dl dt, li")
-        for r in rows:
-            text = (r.inner_text() or "").strip()
-            if not text or len(text) < 5:
+        for frame in page.frames:
+            try:
+                anchors = frame.query_selector_all("a")
+            except Exception:
                 continue
+            for a in anchors:
+                try:
+                    txt = re.sub(r"\s+", " ", (a.inner_text() or "")).strip()
+                    href = a.get_attribute("href") or ""
+                except Exception:
+                    continue
+                if not txt or len(txt) < 4:
+                    continue
+                if any(n in txt for n in NOISE):
+                    continue
+                url = PORTAL_TOP if (href.startswith("javascript") or href == "") else urljoin(frame.url, href)
+                items.append({"title": txt[:120], "meta": "", "url": url})
 
-            # aタグがあればリンク先URLを取得
-            link = r.query_selector("a")
-            href = ""
-            if link:
-                raw_href = link.get_attribute("href") or ""
-                if raw_href and not raw_href.startswith("javascript"):
-                    href = urljoin(page.url, raw_href)
-
-            # タイトルとメタ情報を分離
-            parts = [re.sub(r"\s+", " ", p).strip() for p in text.split("\n") if p.strip()]
-            title = parts[0]
-            # 日付っぽい行やNEWを整理
-            if re.match(r"^(NEW|\d{4}/\d{2}/\d{2}|\d{2}/\d{2})", title) and len(parts) > 1:
-                title = parts[1]
-                meta = " / ".join(parts[0:1] + parts[2:])
-            else:
-                meta = " / ".join(parts[1:])
-
-            if len(title) > 3 and not any(kw in title for kw in ["ログアウト", "メニュー", "パスワード変更", "サイトマップ"]):
-                items.append({
-                    "title": title[:100],
-                    "meta": meta[:150],
-                    "url": href or PORTAL_TOP  # リンクが拾えなければポータルトップへ
-                })
-
-        browser.close()
-
-    # 重複除去
-    unique_items = []
-    seen_titles = set()
+    seen_t, unique = set(), []
     for it in items:
-        if it["title"] not in seen_titles:
-            seen_titles.add(it["title"])
-            unique_items.append(it)
-
-    return unique_items
+        t = it["title"]
+        if looks_like_date(t) and len(t) < 12:
+            continue
+        if t in seen_t:
+            continue
+        seen_t.add(t)
+        unique.append(it)
+    return unique
 
 
 def main():
-    if not DISCORD_WEBHOOKS and not SLACK_WEBHOOKS and not GENERIC_WEBHOOKS:
-        print("[error] 通知先が1つも設定されてへん（DISCORD_WEBHOOK 等を登録してな）")
-        sys.exit(1)
+    if not (DISCORD_WEBHOOKS or SLACK_WEBHOOKS or GENERIC_WEBHOOKS):
+        print("[error] 通知先が未設定"); sys.exit(1)
 
     seen = load_seen()
     scraped = scrape_portal()
-    print(f"[portal-notify] scraped: {len(scraped)} items")
+    print(f"[portal-notify] scraped: {len(scraped)}")
+    if DEBUG:
+        for it in scraped[:60]:
+            print(f"   - {it['title']}  |  {it['url']}")
 
-    # フィルタリング
     if FILTER_KEYWORD:
         scraped = [it for it in scraped if FILTER_KEYWORD in it["title"] or FILTER_KEYWORD in it.get("meta", "")]
 
-    # 初回実行時：基準登録のみ（一斉通知を防ぐ）
     if not seen:
-        print(f"[portal-notify] 初回実行: {len(scraped)} 件を基準登録したで。")
+        print(f"[portal-notify] first run baseline: {len(scraped)}")
         for it in scraped:
             seen.add(it["title"])
         save_seen(seen)
-        broadcast_message(f"✅ **産業能率大学ポータル監視** を開始したで！（基準登録: {len(scraped)}件・リンク付対応版）")
+        broadcast_message(f"✅ 産業能率大学ポータル監視を開始したで。以降、新着お知らせだけを1件ずつ通知するわ。（基準登録: {len(scraped)}件）")
         return
 
-    # 2回目以降：差分（新着）を検出
     new_items = [it for it in scraped if it["title"] not in seen]
     print(f"[portal-notify] new items: {len(new_items)}")
-
     if not new_items:
         print("[portal-notify] no new notices")
         return
 
-    # 通知送信
-    to_notify = new_items[:MAX_ITEMS]
-    broadcast_items(to_notify)
+    for it in new_items[:MAX_NOTIFY]:
+        broadcast_item(it)
 
-    # 記録更新
     for it in new_items:
         seen.add(it["title"])
     save_seen(seen)
-    print(f"[portal-notify] {len(new_items)} items saved to seen.json")
+    print(f"[portal-notify] notified {min(len(new_items), MAX_NOTIFY)} / saved {len(new_items)}")
 
 
 if __name__ == "__main__":
