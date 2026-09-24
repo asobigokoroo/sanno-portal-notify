@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v7.1
-- Basic認証ダイアログ自動突破
-- HTML全方位探索：iframe内・テーブル・div・li などから「日付+タイトル」パターンを抽出
-- DEBUG=1 でHTML冒頭をログ出力（構造確認可能）
-- 新着だけを1件ずつ個別通知（過去分は送らない）
+sanno-portal-notify v8
+- Basic認証突破後、お知らせ受信一覧（wbasmgjr.do）に直接アクセス
+- テーブル行を1行ずつ解析：タイトル / 日付 / 送信者 / 種別 / NEWフラグ
+- 新着だけを1件＝1メッセージで個別通知
 - 複数サーバー対応（Discord複数 / Slack / 汎用Webhook）
 """
 
@@ -17,6 +16,8 @@ import urllib.request
 from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 
+# お知らせ受信一覧ページ（直接アクセス）
+NOTICE_URL = "https://portal-xs.mi.sanno.ac.jp/campusweb/wbasmgjr.do?clearAccessData=true&contenam=wbasmgjr&kjnmnNo=2"
 PORTAL_TOP = "https://portal-xs.mi.sanno.ac.jp/campusweb/top.do"
 SEEN_FILE = "seen.json"
 DEBUG = os.environ.get("DEBUG", "0") == "1"
@@ -28,10 +29,6 @@ SLACK_WEBHOOKS   = [w.strip() for w in os.environ.get("SLACK_WEBHOOK", "").split
 GENERIC_WEBHOOKS = [w.strip() for w in os.environ.get("GENERIC_WEBHOOK", "").split(",") if w.strip()]
 FILTER_KEYWORD = os.environ.get("FILTER_KEYWORD", "").strip()
 MAX_NOTIFY = int(os.environ.get("MAX_NOTIFY_PER_RUN", "20"))
-
-NOISE = ["ログアウト", "メニュー", "パスワード変更", "サイトマップ", "ホーム", "戻る",
-         "在学生", "保護者", "教職員", "ログイン", "ヘルプ", "English", "マイページ",
-         "時間割", "成績", "履修", "シラバス", "掲示板", "授業"]
 
 
 def post_json(url, payload):
@@ -46,11 +43,13 @@ def post_json(url, payload):
 def send_discord_embed(item):
     embed = {
         "title": (item["title"][:240] or "(無題)"),
-        "url": item.get("url") or PORTAL_TOP,
+        "url": NOTICE_URL,  # お知らせ一覧へリンク
         "color": 0x1E88E5,
     }
     if item.get("meta"):
         embed["description"] = item["meta"][:400]
+    if item.get("is_new"):
+        embed["color"] = 0xFF4444  # NEWなら赤色に目立たせる
     embed["footer"] = {"text": "産業能率大学ポータル 新着"}
     for wh in DISCORD_WEBHOOKS:
         try:
@@ -61,8 +60,7 @@ def send_discord_embed(item):
 
 
 def send_slack_item(item):
-    url = item.get("url") or PORTAL_TOP
-    text = f"📢 *新着* <{url}|{item['title']}>"
+    text = f"📢 *新着* <{NOTICE_URL}|{item['title']}>"
     if item.get("meta"):
         text += f"\n>{item['meta']}"
     for wh in SLACK_WEBHOOKS:
@@ -113,62 +111,52 @@ def save_seen(seen):
         json.dump(sorted(list(seen))[-2000:], f, ensure_ascii=False, indent=2)
 
 
-def looks_like_date(s):
-    return re.match(r"^(\d{4}[/年]\d{1,2}[/月]\d{1,2}日?|\d{1,2}/\d{1,2}|NEW|新着)", s) is not None
-
-
-def extract_notices_from_html(html, base_url):
-    """HTML文字列から「日付+タイトル+URL」のお知らせを抽出"""
+def extract_notices_from_page(page):
+    """1ページ分のテーブルからお知らせを抽出"""
     items = []
-
-    # パターン1: table > tr > td 内のテキスト（CampusSquareの定番形式）
-    # 例: <tr><td>2026/05/20</td><td><a href="...">タイトル</a></td></tr>
-    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.DOTALL | re.IGNORECASE)
+    
+    # テーブル行を取得
+    rows = page.query_selector_all("table tbody tr, table tr")
+    print(f"[portal-notify] table rows found: {len(rows)}")
+    
     for row in rows:
-        cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL | re.IGNORECASE)
-        if len(cells) >= 2:
-            date_cell = re.sub(r"<[^>]+>", "", cells[0]).strip()
-            title_cell_html = cells[1]
-            title_text = re.sub(r"<[^>]+>", "", title_cell_html).strip()
-            href_match = re.search(r'href=["\']([^"\']+)["\']', title_cell_html)
-            url = urljoin(base_url, href_match.group(1)) if href_match else base_url
-
-            if looks_like_date(date_cell) and len(title_text) > 3:
-                if not any(n in title_text for n in NOISE):
-                    items.append({
-                        "title": title_text[:120],
-                        "meta": date_cell,
-                        "url": url
-                    })
-
-    # パターン2: li や div 内の「日付 タイトル」形式
-    text_blocks = re.findall(r"<(?:li|div|p|span)[^>]*>(.*?)</(?:li|div|p|span)>", html, re.DOTALL | re.IGNORECASE)
-    for block in text_blocks:
-        text = re.sub(r"<[^>]+>", " ", block).strip()
-        text = re.sub(r"\s+", " ", text)
-        m = re.match(r"(\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|NEW)\s*[/-]?\s*(.+)", text)
-        if m and len(m.group(2)) > 3:
-            if not any(n in m.group(2) for n in NOISE):
-                items.append({
-                    "title": m.group(2)[:120],
-                    "meta": m.group(1),
-                    "url": base_url
-                })
-
-    # パターン3: aタグのテキスト
-    for a_match in re.finditer(r'<a[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html, re.DOTALL | re.IGNORECASE):
-        href = a_match.group(1)
-        link_text = re.sub(r"<[^>]+>", "", a_match.group(2)).strip()
-        link_text = re.sub(r"\s+", " ", link_text)
-        if not link_text or len(link_text) < 4:
+        # タイトルセル（camjnext-list-item-contents クラス）を探す
+        title_cell = row.query_selector(".camjnext-list-item-contents")
+        if not title_cell:
             continue
-        if any(n in link_text for n in NOISE):
+        
+        # タイトルリンク
+        a = title_cell.query_selector("a")
+        if not a:
             continue
-        if looks_like_date(link_text) and len(link_text) < 15:
+        
+        title = a.inner_text().strip()
+        if not title or len(title) < 4:
             continue
-        url = urljoin(base_url, href) if not href.startswith("javascript") else base_url
-        items.append({"title": link_text[:120], "meta": "", "url": url})
-
+        
+        # 日付・送信者・種別を取得（td列から）
+        tds = row.query_selector_all("td")
+        date_str = tds[3].inner_text().strip() if len(tds) > 3 else ""
+        sender   = tds[4].inner_text().strip() if len(tds) > 4 else ""
+        category = tds[5].inner_text().strip() if len(tds) > 5 else ""
+        
+        # NEWタグの有無
+        new_tag = title_cell.query_selector(".camjnext-list-tag-new")
+        is_new = new_tag is not None
+        
+        # meta情報を組み立て
+        meta_parts = [p for p in [date_str, sender, category] if p]
+        meta = " / ".join(meta_parts)
+        if is_new:
+            meta += " / NEW"
+        
+        items.append({
+            "title": title[:200],
+            "meta": meta,
+            "url": NOTICE_URL,
+            "is_new": is_new
+        })
+    
     return items
 
 
@@ -176,7 +164,6 @@ def scrape_portal():
     if not SANNO_ID or not SANNO_PASS:
         print("[error] SANNO_ID / SANNO_PASS 未設定"); sys.exit(1)
 
-    all_items = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -185,68 +172,68 @@ def scrape_portal():
             viewport={"width": 1400, "height": 1000})
         page = context.new_page()
 
-        print("[portal-notify] open portal top (Basic Auth)...")
-        page.goto(PORTAL_TOP, wait_until="networkidle", timeout=45000)
+        print(f"[portal-notify] open notice list: {NOTICE_URL}")
+        page.goto(NOTICE_URL, wait_until="networkidle", timeout=45000)
         print(f"[portal-notify] current url: {page.url}")
-
+        
         if "signweb" in page.url:
             print("[error] Basic認証突破できず。ID/PASSを確認してな。"); sys.exit(2)
+        
+        page.wait_for_timeout(4000)
+        
+        if DEBUG:
+            # HTML冒頭をログ出力
+            html = page.content()
+            preview = html[:1500].replace("\n", " ").replace("  ", " ")
+            print(f"[DEBUG] html_preview={preview}...")
+            # テーブル構造を確認
+            rows = page.query_selector_all("table tr")
+            print(f"[DEBUG] total rows: {len(rows)}")
+            for i, row in enumerate(rows[:5]):
+                txt = row.inner_text().replace("\n", " | ")
+                print(f"[DEBUG] row {i}: {txt[:150]}")
 
-        page.wait_for_timeout(6000)
-
-        # 全フレーム（親＋iframe）のHTMLを取得して解析
-        for i, frame in enumerate(page.frames):
-            try:
-                html = frame.content()
-                url = frame.url
-            except Exception as e:
-                print(f"[warn] frame {i} content failed: {e}")
-                continue
-
-            if DEBUG:
-                preview = html[:2000].replace("\n", " ").replace("  ", " ")
-                print(f"[DEBUG] frame {i} url={url} html_preview={preview[:500]}...")
-
-            items = extract_notices_from_html(html, url or PORTAL_TOP)
-            if DEBUG and items:
-                print(f"[DEBUG] frame {i} extracted {len(items)} items")
-            all_items.extend(items)
-
-        # もし0件なら、お知らせ一覧の可能性がある別URLを試す
-        if not all_items:
-            alt_urls = [
-                "https://portal-xs.mi.sanno.ac.jp/campusweb/campussquare.do",
-                "https://portal-xs.mi.sanno.ac.jp/campusweb/notice.do",
-            ]
-            for alt in alt_urls:
-                try:
-                    print(f"[portal-notify] trying alternative: {alt}")
-                    page.goto(alt, wait_until="networkidle", timeout=30000)
-                    page.wait_for_timeout(3000)
-                    html = page.content()
-                    if DEBUG:
-                        preview = html[:2000].replace("\n", " ").replace("  ", " ")
-                        print(f"[DEBUG] alt url html_preview={preview[:500]}...")
-                    items = extract_notices_from_html(html, page.url)
-                    print(f"[portal-notify] alt url scraped: {len(items)}")
-                    all_items.extend(items)
-                    if items:
+        # 1ページ目を取得
+        all_items = extract_notices_from_page(page)
+        
+        # ページネーション：「次へ」ボタンがあれば全ページ巡回
+        page_num = 1
+        while len(all_items) < 89 and page_num < 15:  # 安全弁：最大15ページ
+            # 次へリンクを探す（> ボタン）
+            next_links = page.query_selector_all("a")
+            next_btn = None
+            for link in next_links:
+                txt = link.inner_text().strip()
+                if txt == ">" or txt == "›" or txt == "→":
+                    # 無効化されていないか確認
+                    onclick = link.get_attribute("onclick") or ""
+                    cls = link.get_attribute("class") or ""
+                    if "disabled" not in cls and "inactive" not in cls:
+                        next_btn = link
                         break
-                except Exception as e:
-                    print(f"[warn] alt url failed: {e}")
+            
+            if not next_btn:
+                break
+            
+            try:
+                print(f"[portal-notify] clicking next page ({page_num + 1})...")
+                next_btn.click()
+                page.wait_for_timeout(3000)
+                page_num += 1
+                items = extract_notices_from_page(page)
+                if not items:
+                    break
+                # 重複を避けるため、新しいものだけ追加
+                existing_titles = {it["title"] for it in all_items}
+                for it in items:
+                    if it["title"] not in existing_titles:
+                        all_items.append(it)
+            except Exception as e:
+                print(f"[warn] pagination failed: {e}")
+                break
 
         browser.close()
-
-    # 重複除去（タイトルで判定）
-    seen_t, unique = set(), []
-    for it in all_items:
-        t = it["title"]
-        if t in seen_t:
-            continue
-        seen_t.add(t)
-        unique.append(it)
-
-    return unique
+        return all_items
 
 
 def main():
@@ -256,20 +243,22 @@ def main():
     seen = load_seen()
     scraped = scrape_portal()
     print(f"[portal-notify] scraped: {len(scraped)}")
-    for it in scraped[:30]:
-        print(f"   - {it['title']}  |  {it['meta']}  |  {it['url']}")
+    for it in scraped[:20]:
+        print(f"   - {'[NEW] ' if it['is_new'] else ''}{it['title']} | {it['meta']}")
 
     if FILTER_KEYWORD:
         scraped = [it for it in scraped if FILTER_KEYWORD in it["title"] or FILTER_KEYWORD in it.get("meta", "")]
 
+    # 初回実行：基準登録のみ（過去分は送らない）
     if not seen:
         print(f"[portal-notify] first run baseline: {len(scraped)}")
         for it in scraped:
             seen.add(it["title"])
         save_seen(seen)
-        broadcast_message(f"✅ 産業能率大学ポータル監視を開始したで。以降、新着お知らせだけを1件ずつ通知するわ。（基準登録: {len(scraped)}件）")
+        broadcast_message(f"✅ 産業能率大学ポータル監視を開始したで！（基準登録: {len(scraped)}件）")
         return
 
+    # 2回目以降：新着だけを1件ずつ個別通知
     new_items = [it for it in scraped if it["title"] not in seen]
     print(f"[portal-notify] new items: {len(new_items)}")
     if not new_items:
