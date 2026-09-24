@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v6
-- 新着お知らせだけを通知（過去分の一覧は送らない）
-- 1件＝1メッセージで個別にポスト（タイトルはクリックでポータルへ）
+sanno-portal-notify v7
+- Basic認証ダイアログ自動突破
+- HTML全方位探索：iframe内・テーブル・div・li などから「日付+タイトル」パターンを抽出
+- DEBUG=1 でHTML冒頭をログ出力（Artifacts不要で構造確認可能）
+- 新着だけを1件ずつ個別通知（過去分は送らない）
 - 複数サーバー対応（Discord複数 / Slack / 汎用Webhook）
-- Basic認証自動突破 / iframe全走査 / DEBUG=1で調査ログ
 """
 
 import os
@@ -29,7 +30,8 @@ FILTER_KEYWORD = os.environ.get("FILTER_KEYWORD", "").strip()
 MAX_NOTIFY = int(os.environ.get("MAX_NOTIFY_PER_RUN", "20"))
 
 NOISE = ["ログアウト", "メニュー", "パスワード変更", "サイトマップ", "ホーム", "戻る",
-         "在学生", "保護者", "教職員", "ログイン", "ヘルプ", "English"]
+         "在学生", "保護者", "教職員", "ログイン", "ヘルプ", "English", "マイページ",
+         "時間割", "成績", "履修", "シラバス", "掲示板", "授業"]
 
 
 def post_json(url, payload):
@@ -111,42 +113,73 @@ def save_seen(seen):
         json.dump(sorted(list(seen))[-2000:], f, ensure_ascii=False, indent=2)
 
 
-def dump_debug(page):
-    os.makedirs("debug", exist_ok=True)
-    all_links = []
-    for i, frame in enumerate(page.frames):
-        try:
-            html = frame.content()
-        except Exception as e:
-            html = f"(取得失敗: {e})"
-        with open(f"debug/frame_{i}.html", "w", encoding="utf-8") as f:
-            f.write(html)
-        try:
-            for a in frame.query_selector_all("a"):
-                href = a.get_attribute("href") or ""
-                txt = (a.inner_text() or "").strip().replace("\n", " ")
-                if href and not href.startswith("javascript"):
-                    all_links.append({"frame": i, "text": txt[:80], "href": href})
-        except Exception:
-            pass
-    with open("debug/links.json", "w", encoding="utf-8") as f:
-        json.dump(all_links, f, ensure_ascii=False, indent=2)
-    try:
-        page.screenshot(path="debug/screenshot.png", full_page=True)
-    except Exception:
-        pass
-    print(f"[portal-notify][DEBUG] frames={len(page.frames)} links={len(all_links)} → debug/ 保存")
-
-
 def looks_like_date(s):
-    return re.match(r"^\s*(\d{4}[/年]\d{1,2}[/月]\d{1,2}日?|\d{1,2}/\d{1,2}|NEW|新着)", s) is not None
+    return re.match(r"^(\d{4}[/年]\d{1,2}[/月]\d{1,2}日?|\d{1,2}/\d{1,2}|NEW|新着)", s) is not None
+
+
+def extract_notices_from_html(html, base_url):
+    """HTML文字列から「日付+タイトル+URL」のお知らせを抽出"""
+    items = []
+n
+    # パターン1: table > tr > td 内のテキスト（CampusSquareの定番形式）
+    # 例: <tr><td>2026/05/20</td><td><a href="...">タイトル</a></td></tr>
+    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.DOTALL | re.IGNORECASE)
+    for row in rows:
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL | re.IGNORECASE)
+        if len(cells) >= 2:
+            date_cell = re.sub(r"<[^>]+>", "", cells[0]).strip()
+            title_cell_html = cells[1]
+            title_text = re.sub(r"<[^>]+>", "", title_cell_html).strip()
+            href_match = re.search(r'href=["\\']([^"\\']+)["\\']', title_cell_html)
+            url = urljoin(base_url, href_match.group(1)) if href_match else base_url
+
+            if looks_like_date(date_cell) and len(title_text) > 3:
+                if not any(n in title_text for n in NOISE):
+                    items.append({
+                        "title": title_text[:120],
+                        "meta": date_cell,
+                        "url": url
+                    })
+
+    # パターン2: li や div 内の「日付 タイトル」形式
+    # 例: <li>2026/05/20 タイトル</li> や <div class="info">...</div>
+    text_blocks = re.findall(r"<(?:li|div|p|span)[^>]*>(.*?)</(?:li|div|p|span)>", html, re.DOTALL | re.IGNORECASE)
+    for block in text_blocks:
+        text = re.sub(r"<[^>]+>", " ", block).strip()
+        text = re.sub(r"\s+", " ", text)
+        # 「日付 タイトル」または「日付 / タイトル」パターン
+        m = re.match(r"(\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|NEW)\s*[/-]?\s*(.+)", text)
+        if m and len(m.group(2)) > 3:
+            if not any(n in m.group(2) for n in NOISE):
+                items.append({
+                    "title": m.group(2)[:120],
+                    "meta": m.group(1),
+                    "url": base_url
+                })
+
+    # パターン3: aタグのテキストが日付っぽいものを含む行
+    # （前回の方式を残しつつ強化）
+    for a_match in re.finditer(r'<a[^>]*href=["\\']([^"\\']+)["\\'][^>]*>(.*?)</a>', html, re.DOTALL | re.IGNORECASE):
+        href = a_match.group(1)
+        link_text = re.sub(r"<[^>]+>", "", a_match.group(2)).strip()
+        link_text = re.sub(r"\s+", " ", link_text)
+        if not link_text or len(link_text) < 4:
+            continue
+        if any(n in link_text for n in NOISE):
+            continue
+        if looks_like_date(link_text) and len(link_text) < 15:
+            continue
+        url = urljoin(base_url, href) if not href.startswith("javascript") else base_url
+        items.append({"title": link_text[:120], "meta": "", "url": url})
+
+    return items
 
 
 def scrape_portal():
     if not SANNO_ID or not SANNO_PASS:
         print("[error] SANNO_ID / SANNO_PASS 未設定"); sys.exit(1)
 
-    items = []
+    all_items = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -154,43 +187,70 @@ def scrape_portal():
             http_credentials={"username": SANNO_ID, "password": SANNO_PASS},
             viewport={"width": 1400, "height": 1000})
         page = context.new_page()
+
         print("[portal-notify] open portal top (Basic Auth)...")
         page.goto(PORTAL_TOP, wait_until="networkidle", timeout=45000)
         print(f"[portal-notify] current url: {page.url}")
+
         if "signweb" in page.url:
             print("[error] Basic認証突破できず。ID/PASSを確認してな。"); sys.exit(2)
-        page.wait_for_timeout(4000)
 
-        if DEBUG:
-            dump_debug(page)
+        # iframeの読み込みを待つ（最大10秒）
+        page.wait_for_timeout(6000)
 
-        for frame in page.frames:
+        # 全フレーム（親＋iframe）のHTMLを取得して解析
+        for i, frame in enumerate(page.frames):
             try:
-                anchors = frame.query_selector_all("a")
-            except Exception:
+                html = frame.content()
+                url = frame.url
+            except Exception as e:
+                print(f"[warn] frame {i} content failed: {e}")
                 continue
-            for a in anchors:
-                try:
-                    txt = re.sub(r"\s+", " ", (a.inner_text() or "")).strip()
-                    href = a.get_attribute("href") or ""
-                except Exception:
-                    continue
-                if not txt or len(txt) < 4:
-                    continue
-                if any(n in txt for n in NOISE):
-                    continue
-                url = PORTAL_TOP if (href.startswith("javascript") or href == "") else urljoin(frame.url, href)
-                items.append({"title": txt[:120], "meta": "", "url": url})
 
+            if DEBUG:
+                # HTMLの冒頭2000文字をログに出力（構造確認用）
+                preview = html[:2000].replace("\n", " ").replace("  ", " ")
+                print(f"[DEBUG] frame {i} url={url} html_preview={preview[:500]}...")
+
+            items = extract_notices_from_html(html, url or PORTAL_TOP)
+            if DEBUG and items:
+                print(f"[DEBUG] frame {i} extracted {len(items)} items")
+            all_items.extend(items)
+
+        # もし0件なら、お知らせ一覧の可能性がある別URLを試す
+        if not all_items:
+            alt_urls = [
+                "https://portal-xs.mi.sanno.ac.jp/campusweb/campussquare.do",
+                "https://portal-xs.mi.sanno.ac.jp/campusweb/notice.do",
+            ]
+            for alt in alt_urls:
+                try:
+                    print(f"[portal-notify] trying alternative: {alt}")
+                    page.goto(alt, wait_until="networkidle", timeout=30000)
+                    page.wait_for_timeout(3000)
+                    html = page.content()
+                    if DEBUG:
+                        preview = html[:2000].replace("\n", " ").replace("  ", " ")
+                        print(f"[DEBUG] alt url html_preview={preview[:500]}...")
+                    items = extract_notices_from_html(html, page.url)
+                    print(f"[portal-notify] alt url scraped: {len(items)}")
+                    all_items.extend(items)
+                    if items:
+                        break
+                except Exception as e:
+                    print(f"[warn] alt url failed: {e}")
+
+        browser.close()
+
+    # 重複除去（タイトルで判定）
     seen_t, unique = set(), []
-    for it in items:
+    for it in all_items:
         t = it["title"]
-        if looks_like_date(t) and len(t) < 12:
-            continue
         if t in seen_t:
             continue
         seen_t.add(t)
         unique.append(it)
+
     return unique
 
 
@@ -201,9 +261,8 @@ def main():
     seen = load_seen()
     scraped = scrape_portal()
     print(f"[portal-notify] scraped: {len(scraped)}")
-    if DEBUG:
-        for it in scraped[:60]:
-            print(f"   - {it['title']}  |  {it['url']}")
+    for it in scraped[:30]:
+        print(f"   - {it['title']}  |  {it['meta']}  |  {it['url']}")
 
     if FILTER_KEYWORD:
         scraped = [it for it in scraped if FILTER_KEYWORD in it["title"] or FILTER_KEYWORD in it.get("meta", "")]
