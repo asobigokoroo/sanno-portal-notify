@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v7
+sanno-portal-notify v7.1
 - Basic認証ダイアログ自動突破
 - HTML全方位探索：iframe内・テーブル・div・li などから「日付+タイトル」パターンを抽出
-- DEBUG=1 でHTML冒頭をログ出力（Artifacts不要で構造確認可能）
+- DEBUG=1 でHTML冒頭をログ出力（構造確認可能）
 - 新着だけを1件ずつ個別通知（過去分は送らない）
 - 複数サーバー対応（Discord複数 / Slack / 汎用Webhook）
 """
@@ -120,7 +120,7 @@ def looks_like_date(s):
 def extract_notices_from_html(html, base_url):
     """HTML文字列から「日付+タイトル+URL」のお知らせを抽出"""
     items = []
-n
+
     # パターン1: table > tr > td 内のテキスト（CampusSquareの定番形式）
     # 例: <tr><td>2026/05/20</td><td><a href="...">タイトル</a></td></tr>
     rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.DOTALL | re.IGNORECASE)
@@ -130,7 +130,7 @@ n
             date_cell = re.sub(r"<[^>]+>", "", cells[0]).strip()
             title_cell_html = cells[1]
             title_text = re.sub(r"<[^>]+>", "", title_cell_html).strip()
-            href_match = re.search(r'href=["\\']([^"\\']+)["\\']', title_cell_html)
+            href_match = re.search(r'href=["\']([^"\']+)["\']', title_cell_html)
             url = urljoin(base_url, href_match.group(1)) if href_match else base_url
 
             if looks_like_date(date_cell) and len(title_text) > 3:
@@ -142,12 +142,10 @@ n
                     })
 
     # パターン2: li や div 内の「日付 タイトル」形式
-    # 例: <li>2026/05/20 タイトル</li> や <div class="info">...</div>
     text_blocks = re.findall(r"<(?:li|div|p|span)[^>]*>(.*?)</(?:li|div|p|span)>", html, re.DOTALL | re.IGNORECASE)
     for block in text_blocks:
         text = re.sub(r"<[^>]+>", " ", block).strip()
         text = re.sub(r"\s+", " ", text)
-        # 「日付 タイトル」または「日付 / タイトル」パターン
         m = re.match(r"(\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|NEW)\s*[/-]?\s*(.+)", text)
         if m and len(m.group(2)) > 3:
             if not any(n in m.group(2) for n in NOISE):
@@ -157,9 +155,8 @@ n
                     "url": base_url
                 })
 
-    # パターン3: aタグのテキストが日付っぽいものを含む行
-    # （前回の方式を残しつつ強化）
-    for a_match in re.finditer(r'<a[^>]*href=["\\']([^"\\']+)["\\'][^>]*>(.*?)</a>', html, re.DOTALL | re.IGNORECASE):
+    # パターン3: aタグのテキスト
+    for a_match in re.finditer(r'<a[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html, re.DOTALL | re.IGNORECASE):
         href = a_match.group(1)
         link_text = re.sub(r"<[^>]+>", "", a_match.group(2)).strip()
         link_text = re.sub(r"\s+", " ", link_text)
@@ -195,7 +192,6 @@ def scrape_portal():
         if "signweb" in page.url:
             print("[error] Basic認証突破できず。ID/PASSを確認してな。"); sys.exit(2)
 
-        # iframeの読み込みを待つ（最大10秒）
         page.wait_for_timeout(6000)
 
         # 全フレーム（親＋iframe）のHTMLを取得して解析
@@ -208,7 +204,6 @@ def scrape_portal():
                 continue
 
             if DEBUG:
-                # HTMLの冒頭2000文字をログに出力（構造確認用）
                 preview = html[:2000].replace("\n", " ").replace("  ", " ")
                 print(f"[DEBUG] frame {i} url={url} html_preview={preview[:500]}...")
 
