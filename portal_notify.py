@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v13
-- top.do にログイン → ページ内の「お知らせ」リンクをクリックして遷移
-- セッション維持のため、直接URLを打ち込まずリンクを辿る
+sanno-portal-notify v14
+- ログイン判定を「form[name="loginForm"]」で行う（#userIdだけだと誤判定するため）
+- top.do にログイン → お知らせリンクをクリックして遷移
 """
 
 import os
@@ -153,6 +153,18 @@ def extract_notices(page):
     return items
 
 
+# ===== ログインフォームが表示中か判定 =====
+def is_login_page(page):
+    """ログインフォームが表示されているか（ログインが必要か）を判定"""
+    # form[name="loginForm"] が見えてる = ログインページ
+    login_form = page.locator('form[name="loginForm"]')
+    if login_form.count() > 0:
+        # さらに、フォームが表示されているか（hiddenでないか）も確認
+        is_visible = login_form.first.is_visible()
+        return is_visible
+    return False
+
+
 # ===== メイン処理 =====
 def scrape():
     print("=== SCRAPE START ===", flush=True)
@@ -179,8 +191,11 @@ def scrape():
                 f.write(page.content())
 
         # --- 2. ログインフォームがあれば入力 ---
-        if page.locator("#userId").count() > 0:
-            print("[INFO] Login form found. Logging in...", flush=True)
+        on_login = is_login_page(page)
+        print(f"[INFO] Login page detected: {on_login}", flush=True)
+
+        if on_login:
+            print("[INFO] Logging in...", flush=True)
 
             if DEBUG:
                 page.screenshot(path="debug_02_login.png", full_page=True)
@@ -188,7 +203,7 @@ def scrape():
             page.fill("#userId", SANNO_ID)
             page.fill("#password", SANNO_PASS)
 
-            print("[INFO] Calling exec() via JavaScript...", flush=True)
+            print("[INFO] Calling exec()...", flush=True)
             try:
                 result = page.evaluate("""() => {
                     if (typeof exec === 'function') {
@@ -211,18 +226,22 @@ def scrape():
                 with open("debug_03_after_login.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
 
-        # --- 3. ログイン後の top.do から「お知らせ」リンクを探してクリック ---
-        # まず、現在のページにログインフォームが残ってないか確認
-        if page.locator("#userId").count() > 0:
-            print("[ERROR] Still on login page after login! Check ID/PASS.", flush=True)
+        # --- 3. ログイン後、まだログインフォームが残ってないか確認 ---
+        still_login = is_login_page(page)
+        print(f"[INFO] Still on login page after login: {still_login}", flush=True)
+
+        if still_login:
+            print("[ERROR] Login failed! Still on login page. Check ID/PASS.", flush=True)
             if DEBUG:
-                page.screenshot(path="debug_error_still_login.png", full_page=True)
+                page.screenshot(path="debug_error_login_failed.png", full_page=True)
             browser.close()
             sys.exit(2)
 
-        print("[INFO] Login successful! Looking for notice link...", flush=True)
+        print("[INFO] Login successful!", flush=True)
 
-        # 「お知らせ」リンクを探す（複数のパターンを試す）
+        # --- 4. top.do から「お知らせ」リンクを探してクリック ---
+        print("[INFO] Looking for notice link...", flush=True)
+
         notice_selectors = [
             'a:has-text("お知らせ")',
             'a[href*="wbasmgjr"]',
@@ -234,7 +253,7 @@ def scrape():
         for sel in notice_selectors:
             if page.locator(sel).count() > 0:
                 notice_link = page.locator(sel).first
-                print(f"[INFO] Found notice link with selector: {sel}", flush=True)
+                print(f"[INFO] Found notice link with: {sel}", flush=True)
                 break
 
         if notice_link:
@@ -242,16 +261,15 @@ def scrape():
             notice_link.click()
             page.wait_for_load_state("networkidle", timeout=30000)
             page.wait_for_timeout(3000)
-            print(f"[INFO] URL after clicking notice: {page.url}", flush=True)
+            print(f"[INFO] URL after notice click: {page.url}", flush=True)
         else:
-            print("[WARN] Notice link not found on top.do. Falling back to direct URL.", flush=True)
-            # fallback: 直接アクセス（セッションが維持されることを祈る）
+            print("[WARN] Notice link not found. Trying direct URL...", flush=True)
             page.goto(NOTICE_URL, wait_until="networkidle", timeout=45000)
             print(f"[INFO] URL after direct goto: {page.url}", flush=True)
 
         # お知らせページに来れたか確認
-        if page.locator("#userId").count() > 0:
-            print("[ERROR] Session lost! Redirected to login page.", flush=True)
+        if is_login_page(page):
+            print("[ERROR] Session lost! Redirected to login.", flush=True)
             if DEBUG:
                 page.screenshot(path="debug_error_session_lost.png", full_page=True)
             browser.close()
@@ -265,7 +283,7 @@ def scrape():
                 f.write(page.content())
             print("[DEBUG] Saved debug_04_notice.png/html", flush=True)
 
-        # --- 4. お知らせ抽出 ---
+        # --- 5. お知らせ抽出 ---
         items = extract_notices(page)
         print(f"[INFO] Extracted {len(items)} notices", flush=True)
 
