@@ -2,11 +2,8 @@ name: SANNO Portal Notify
 
 on:
   schedule:
-    - cron: "5 23 * * *"   # 08:05 JST
-    - cron: "5 3 * * *"    # 12:05 JST
-    - cron: "5 9 * * *"    # 18:05 JST
-    - cron: "5 13 * * *"   # 22:05 JST
-  workflow_dispatch: {}
+    - cron: "0 * * * *"      # 毎時0分に実行（JSTで毎時）
+  workflow_dispatch: {}       # 手動実行もできるようにしておく
 
 permissions:
   contents: write
@@ -15,7 +12,7 @@ permissions:
 jobs:
   notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,14 +28,21 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: 通知機能を実行
+      - name: Run notifier
         env:
           SANNO_ID: ${{ secrets.SANNO_ID }}
           SANNO_PASS: ${{ secrets.SANNO_PASS }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           DEBUG: "1"
-        run: python portal_notify.py
-        
+        run: |
+          echo "=== ファイル確認 ==="
+          ls -la portal_notify.py
+          wc -l portal_notify.py
+          head -3 portal_notify.py
+          echo "=== 実行開始 ==="
+          python portal_notify.py
+          echo "=== 実行終了（exit code: $?）==="
+
       - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
