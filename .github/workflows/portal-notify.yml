@@ -1,3 +1,36 @@
+name: SANNO Portal Notify
+
+on:
+  schedule:
+    - cron: "5 23 * * *"   # 08:05 JST
+    - cron: "5 3 * * *"    # 12:05 JST
+    - cron: "5 9 * * *"    # 18:05 JST
+    - cron: "5 13 * * *"   # 22:05 JST
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
       - name: Run notifier
         env:
           SANNO_ID: ${{ secrets.SANNO_ID }}
@@ -15,3 +48,11 @@
             debug_*.png
             debug_*.html
           retention-days: 3
+
+      - name: Commit seen.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen.json || true
+          git commit -m "chore: update seen.json [skip ci]" || echo "no changes"
+          git push || echo "push skipped"
