@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v11
+sanno-portal-notify v12
 - top.do にログイン → お知らせページへ遷移
+- JavaScriptのexec()関数を使ったログイン対応
 - 個別のお知らせURLを取得してDiscord通知
-- 新着のみ通知、初回は基準登録
 """
 
 import os
@@ -42,13 +42,11 @@ def send_discord(title, meta, url, is_new=False):
     embed = {
         "title": title[:250] or "(無題)",
         "url": url,
-        "description": meta[:500] if meta else None,
         "color": color,
         "footer": {"text": "産業能率大学ポータル"}
     }
-    # descriptionがNoneやったらキーごと消す
-    if not embed["description"]:
-        del embed["description"]
+    if meta:
+        embed["description"] = meta[:500]
 
     payload = {"embeds": [embed]}
     for wh in DISCORD_WEBHOOKS:
@@ -112,7 +110,6 @@ def extract_notices(page):
     print(f"[INFO] Found {len(rows)} table rows", flush=True)
 
     for row in rows:
-        # タイトルセル
         title_cell = row.query_selector(".camjnext-list-item-contents")
         if not title_cell:
             continue
@@ -125,13 +122,12 @@ def extract_notices(page):
         if not title or len(title) < 3:
             continue
 
-        # 個別URLを取得（これが重要！）
+        # 個別URLを取得
         href = link.get_attribute("href")
         if href:
-            # 相対URLを絶対URLに変換
             item_url = urljoin(page.url, href)
         else:
-            item_url = NOTICE_URL  # fallback
+            item_url = NOTICE_URL
 
         # 日付・送信者・種別
         tds = row.query_selector_all("td")
@@ -192,7 +188,23 @@ def scrape():
 
             page.fill("#userId", SANNO_ID)
             page.fill("#password", SANNO_PASS)
-            page.click("#loginButton")
+
+            # JavaScriptのexec()関数を使ってログイン
+            print("[INFO] Calling exec() via JavaScript...", flush=True)
+            try:
+                result = page.evaluate("""() => {
+                    if (typeof exec === 'function') {
+                        exec('login', document.getElementById('loginButtonDummy'), null);
+                        return 'exec_called';
+                    }
+                    return 'exec_not_found';
+                }""")
+                print(f"[INFO] exec() result: {result}", flush=True)
+            except Exception as e:
+                print(f"[WARN] exec() failed: {e}", flush=True)
+                # fallback: フォーム直接submit
+                page.evaluate("document.forms['loginForm'].submit()")
+                print("[INFO] Submitted form directly", flush=True)
 
             page.wait_for_load_state("networkidle", timeout=30000)
             print(f"[INFO] URL after login: {page.url}", flush=True)
@@ -227,7 +239,7 @@ def scrape():
         items = extract_notices(page)
         print(f"[INFO] Extracted {len(items)} notices", flush=True)
 
-        # ページネーション（次へボタン）
+        # ページネーション
         page_num = 1
         while len(items) < 90 and page_num < 10:
             next_btn = None
@@ -271,7 +283,6 @@ def main():
     seen = load_seen()
     items = scrape()
 
-    # フィルター
     if FILTER_KEYWORD:
         items = [it for it in items if FILTER_KEYWORD in it["title"] or FILTER_KEYWORD in it.get("meta", "")]
 
@@ -279,13 +290,13 @@ def main():
     if not seen:
         print(f"[INFO] First run! Registering {len(items)} items as baseline.", flush=True)
         for it in items:
-            seen.add(it["url"])  # URLで管理する方が確実
+            seen.add(it["url"])
         save_seen(seen)
         send_text(f"✅ 産業能率大学ポータルの監視を開始したで！（基準登録: {len(items)}件）")
         print("=== MAIN END (first run) ===", flush=True)
         return
 
-    # 新着判定（URLで比較）
+    # 新着判定
     new_items = [it for it in items if it["url"] not in seen]
     print(f"[INFO] New items: {len(new_items)}", flush=True)
 
