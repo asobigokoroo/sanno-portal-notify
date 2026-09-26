@@ -2,8 +2,8 @@ name: SANNO Portal Notify
 
 on:
   schedule:
-    - cron: "0 * * * *"      # 毎時0分に実行（JSTで毎時）
-  workflow_dispatch: {}       # 手動実行もできるようにしておく
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
 
 permissions:
   contents: write
