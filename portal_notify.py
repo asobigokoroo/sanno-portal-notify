@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v17
-- signweb.mi.sanno.ac.jp/portal/ にアクセス（Basic認証 or フォーム）
-- ログイン後、Ca-Inリンク（id=cain）をクリック
-- Ca-Inのお知らせを取得してDiscord通知
+sanno-portal-notify v18
+- signweb.mi.sanno.ac.jp/portal/ にアクセス
+- ページ内のログインフォームを探して入力
+- ログイン後、Ca-Inリンクをクリック → お知らせ取得
 """
 
 import os
@@ -102,11 +102,9 @@ def save_seen(seen_set):
         print(f"[WARN] save_seen failed: {e}", flush=True)
 
 
-# ===== お知らせ抽出（Ca-Inページ用・汎用） =====
+# ===== お知らせ抽出 =====
 def extract_notices(page):
     items = []
-    
-    # 方法1: テーブル行から抽出（既存のセレクタ）
     rows = page.query_selector_all("table tbody tr, table tr")
     print(f"[INFO] Found {len(rows)} table rows", flush=True)
 
@@ -149,23 +147,6 @@ def extract_notices(page):
             "is_new": is_new
         })
 
-    # 方法2: テーブルが無かったら、ページ内のリンクから「お知らせ」っぽいものを探す（fallback）
-    if not items:
-        print("[INFO] No table found. Trying generic link extraction...", flush=True)
-        all_links = page.query_selector_all("a")
-        for link in all_links:
-            href = link.get_attribute("href") or ""
-            text = link.inner_text().strip()
-            # お知らせっぽいリンクを探す（日付っぽい文字列や「お知らせ」を含むもの）
-            if text and len(text) > 5 and ("お知らせ" in text or "通知" in text or re.search(r"\d{4}[/\-]\d{1,2}[/\-]\d{1,2}", text)):
-                item_url = urljoin(page.url, href) if href else page.url
-                items.append({
-                    "title": text[:200],
-                    "meta": "",
-                    "url": item_url,
-                    "is_new": False
-                })
-
     return items
 
 
@@ -180,7 +161,6 @@ def scrape():
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            http_credentials={"username": SANNO_ID, "password": SANNO_PASS},  # Basic認証用
             viewport={"width": 1400, "height": 1000}
         )
         page = context.new_page()
@@ -188,7 +168,7 @@ def scrape():
         # --- 1. ポータルページにアクセス ---
         print(f"[INFO] Opening {PORTAL_URL}", flush=True)
         page.goto(PORTAL_URL, wait_until="networkidle", timeout=45000)
-        print(f"[INFO] URL after portal: {page.url}", flush=True)
+        print(f"[INFO] URL after opening: {page.url}", flush=True)
 
         if DEBUG:
             page.screenshot(path="debug_01_portal.png", full_page=True)
@@ -196,68 +176,133 @@ def scrape():
                 f.write(page.content())
             print("[DEBUG] Saved debug_01_portal.html/png", flush=True)
 
-        # --- 2. ログインフォームがあれば入力（Basic認証失敗時のfallback）---
-        # signwebのログインフォームを探す（idがuserIdやったら）
-        login_form = page.locator("#userId")
-        if login_form.count() > 0 and login_form.first.is_visible():
-            print("[INFO] Login form found on portal. Logging in...", flush=True)
+        # --- 2. ページの状態を診断 ---
+        print("[INFO] Diagnosing page state...", flush=True)
+
+        # 可能性1: すでにログイン済み（Ca-Inリンクがある）
+        has_cain = page.locator("#cain").count() > 0
+        has_student_id = SANNO_ID in (page.locator("body").inner_text() or "")
+
+        # 可能性2: ログインフォームがある（portal-xs側のフォーム）
+        has_login_form = page.locator('form[name="loginForm"]').count() > 0
+        has_userid_field = page.locator("#userId").count() > 0
+
+        # 可能性3: 別のログインフォーム（汎用）
+        has_generic_login = page.locator('input[type="password"]').count() > 0
+
+        print(f"[INFO] has_cain_link={has_cain}, has_student_id={has_student_id}, has_login_form={has_login_form}, has_userid={has_userid_field}, has_password_field={has_generic_login}", flush=True)
+
+        # --- 3. ログインが必要なら実行 ---
+        if has_login_form or has_userid_field:
+            print("[INFO] Login form detected. Logging in...", flush=True)
 
             if DEBUG:
                 page.screenshot(path="debug_02_login.png", full_page=True)
 
-            page.fill("#userId", SANNO_ID)
-            page.fill("#password", SANNO_PASS)
+            # 入力欄を探して入力
+            if page.locator("#userId").count() > 0:
+                page.fill("#userId", SANNO_ID)
+                print("[INFO] Filled #userId", flush=True)
+            elif page.locator('input[name="j_username"]').count() > 0:
+                page.fill('input[name="j_username"]', SANNO_ID)
+                print("[INFO] Filled j_username", flush=True)
+            elif page.locator('input[type="text"]').count() > 0:
+                page.fill('input[type="text"]', SANNO_ID)
+                print("[INFO] Filled first text input", flush=True)
 
-            # buttonNameをセットして送信
-            print("[INFO] Submitting login form...", flush=True)
-            try:
-                with page.expect_navigation(timeout=15000):
-                    page.evaluate("""() => {
-                        var dummy = document.getElementById('loginButtonDummy');
-                        if (dummy) dummy.value = 'login';
-                        var form = document.forms['loginForm'];
-                        if (form) form.submit();
-                    }""")
-                print(f"[INFO] URL after login: {page.url}", flush=True)
-            except Exception as e:
-                print(f"[WARN] Login navigation issue: {e}", flush=True)
-                page.wait_for_load_state("networkidle", timeout=10000)
-                print(f"[INFO] URL after wait: {page.url}", flush=True)
+            if page.locator("#password").count() > 0:
+                page.fill("#password", SANNO_PASS)
+                print("[INFO] Filled #password", flush=True)
+            elif page.locator('input[name="j_password"]').count() > 0:
+                page.fill('input[name="j_password"]', SANNO_PASS)
+                print("[INFO] Filled j_password", flush=True)
+            elif page.locator('input[type="password"]').count() > 0:
+                page.fill('input[type="password"]', SANNO_PASS)
+                print("[INFO] Filled first password input", flush=True)
+
+            # 送信ボタンを探してクリック
+            print("[INFO] Looking for submit button...", flush=True)
+            submit_selectors = [
+                "#loginButton",
+                'button[type="submit"]',
+                'input[type="submit"]',
+                'button:has-text("ログイン")',
+                'input[value="ログイン"]',
+            ]
+
+            submit_btn = None
+            for sel in submit_selectors:
+                if page.locator(sel).count() > 0:
+                    submit_btn = page.locator(sel).first
+                    print(f"[INFO] Found submit button: {sel}", flush=True)
+                    break
+
+            if submit_btn:
+                try:
+                    with page.expect_navigation(timeout=15000):
+                        submit_btn.click()
+                    print(f"[INFO] URL after click: {page.url}", flush=True)
+                except Exception as e:
+                    print(f"[WARN] Click navigation issue: {e}", flush=True)
+                    page.wait_for_timeout(3000)
+                    print(f"[INFO] URL after wait: {page.url}", flush=True)
+            else:
+                # ボタン見つからんかったらフォーム直接送信
+                print("[INFO] No button found, submitting form directly...", flush=True)
+                try:
+                    with page.expect_navigation(timeout=15000):
+                        page.evaluate("""() => {
+                            var dummy = document.getElementById('loginButtonDummy');
+                            if (dummy) dummy.value = 'login';
+                            var form = document.forms['loginForm'];
+                            if (form) form.submit();
+                        }""")
+                    print(f"[INFO] URL after form submit: {page.url}", flush=True)
+                except Exception as e:
+                    print(f"[WARN] Form submit issue: {e}", flush=True)
+                    page.wait_for_timeout(3000)
+                    print(f"[INFO] URL after wait: {page.url}", flush=True)
 
             if DEBUG:
                 page.screenshot(path="debug_03_after_login.png", full_page=True)
                 with open("debug_03_after_login.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
+                print("[DEBUG] Saved debug_03_after_login.html/png", flush=True)
 
-        # --- 3. ポータルページに入れたか確認 ---
-        # 学籍番号が表示されてるか、Ca-Inリンクがあるかで判定
-        page_text = page.locator("body").inner_text()
-        has_cain_link = page.locator("#cain").count() > 0 or page.locator('a[href*="camj_pc"]').count() > 0
+        # --- 4. ログイン後の状態を確認 ---
+        print("[INFO] Checking post-login state...", flush=True)
+        has_cain = page.locator("#cain").count() > 0
+        page_text = page.locator("body").inner_text() or ""
         has_student_id = SANNO_ID in page_text
 
-        print(f"[INFO] Has Ca-In link: {has_cain_link}, Has student ID: {has_student_id}", flush=True)
+        print(f"[INFO] After login - has_cain={has_cain}, has_student_id={has_student_id}", flush=True)
 
-        if not has_cain_link and not has_student_id:
+        if not has_cain and not has_student_id:
             print("[ERROR] Failed to enter portal page. Check ID/PASS or page structure.", flush=True)
             if DEBUG:
                 page.screenshot(path="debug_error_not_portal.png", full_page=True)
+                # ページ内の全リンクを出力してデバッグ
+                links = page.query_selector_all("a")
+                print(f"[DEBUG] All links on page ({len(links)}):", flush=True)
+                for i, link in enumerate(links[:20]):
+                    txt = link.inner_text().strip()[:50]
+                    href = link.get_attribute("href") or ""
+                    print(f"  [{i}] {txt} -> {href}", flush=True)
             browser.close()
             sys.exit(2)
 
         print("[INFO] Portal page loaded successfully!", flush=True)
 
-        # --- 4. Ca-Inリンクをクリック ---
+        # --- 5. Ca-Inリンクをクリック ---
         print("[INFO] Looking for Ca-In link...", flush=True)
         cain_link = None
 
-        # 方法1: id="cain" で探す
         if page.locator("#cain").count() > 0:
             cain_link = page.locator("#cain").first
-            print("[INFO] Found Ca-In link by #cain", flush=True)
-        # 方法2: hrefに camj_pc を含むリンクを探す
+            print("[INFO] Found Ca-In by #cain", flush=True)
         elif page.locator('a[href*="camj_pc"]').count() > 0:
             cain_link = page.locator('a[href*="camj_pc"]').first
-            print("[INFO] Found Ca-In link by href", flush=True)
+            print("[INFO] Found Ca-In by href", flush=True)
 
         if not cain_link:
             print("[ERROR] Ca-In link not found!", flush=True)
@@ -271,9 +316,9 @@ def scrape():
             with page.expect_navigation(timeout=15000):
                 cain_link.click()
             page.wait_for_timeout(3000)
-            print(f"[INFO] URL after Ca-In click: {page.url}", flush=True)
+            print(f"[INFO] URL after Ca-In: {page.url}", flush=True)
         except Exception as e:
-            print(f"[WARN] Ca-In click navigation issue: {e}", flush=True)
+            print(f"[WARN] Ca-In click issue: {e}", flush=True)
             page.wait_for_timeout(3000)
             print(f"[INFO] URL after wait: {page.url}", flush=True)
 
@@ -283,9 +328,8 @@ def scrape():
                 f.write(page.content())
             print("[DEBUG] Saved debug_04_cain.html/png", flush=True)
 
-        # --- 5. Ca-Inページ内で「お知らせ」リンクを探す ---
-        # Ca-Inのトップページに「お知らせ」へのリンクがあるかも
-        print("[INFO] Looking for notice link in Ca-In...", flush=True)
+        # --- 6. Ca-Inページ内で「お知らせ」リンクを探す ---
+        print("[INFO] Looking for notice link...", flush=True)
         notice_link = None
 
         notice_selectors = [
@@ -293,7 +337,6 @@ def scrape():
             'a:has-text("大学からのお知らせ")',
             'a[href*="wbasmgjr"]',
             'a[href*="notice"]',
-            'a[href*="information"]',
         ]
 
         for sel in notice_selectors:
@@ -308,7 +351,7 @@ def scrape():
                 with page.expect_navigation(timeout=15000):
                     notice_link.click()
                 page.wait_for_timeout(3000)
-                print(f"[INFO] URL after notice click: {page.url}", flush=True)
+                print(f"[INFO] URL after notice: {page.url}", flush=True)
             except Exception as e:
                 print(f"[WARN] Notice click issue: {e}", flush=True)
 
@@ -316,8 +359,9 @@ def scrape():
                 page.screenshot(path="debug_05_notice.png", full_page=True)
                 with open("debug_05_notice.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
+                print("[DEBUG] Saved debug_05_notice.html/png", flush=True)
 
-        # --- 6. お知らせ抽出 ---
+        # --- 7. お知らせ抽出 ---
         items = extract_notices(page)
         print(f"[INFO] Extracted {len(items)} notices", flush=True)
 
