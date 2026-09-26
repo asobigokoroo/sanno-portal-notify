@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v21
-- Basic認証を Authorization ヘッダーで確実に通過
-- ポータル→Ca-In→お知らせ の流れ
+sanno-portal-notify v22
+- 毎回実行サマリーをDiscordに送信（デバッグ用）
+- Discordエラーレスポンスを詳細出力
 """
 
 import os
@@ -11,10 +11,11 @@ import json
 import sys
 import base64
 import urllib.request
+import urllib.error
 from urllib.parse import urljoin
 
 print("=" * 50, flush=True)
-print("=== SCRIPT STARTED v21 ===", flush=True)
+print("=== SCRIPT STARTED v22 ===", flush=True)
 print("=" * 50, flush=True)
 
 from playwright.sync_api import sync_playwright
@@ -33,9 +34,11 @@ FILTER_KEYWORD = os.environ.get("FILTER_KEYWORD", "").strip()
 MAX_NOTIFY = int(os.environ.get("MAX_NOTIFY_PER_RUN", "20"))
 
 print(f"DEBUG={DEBUG}, ID={'set' if SANNO_ID else 'EMPTY'}, PASS={'set' if SANNO_PASS else 'EMPTY'}, WEBHOOKS={len(DISCORD_WEBHOOKS)}", flush=True)
+for i, wh in enumerate(DISCORD_WEBHOOKS):
+    print(f"  WEBHOOK[{i}]={wh[:50]}...", flush=True)
 
 
-# ===== Discord送信 =====
+# ===== Discord送信（エラー詳細版） =====
 def send_discord(title, meta, url, is_new=False):
     color = 0xFF4444 if is_new else 0x1E88E5
     embed = {
@@ -57,7 +60,11 @@ def send_discord(title, meta, url, is_new=False):
                 method="POST"
             )
             with urllib.request.urlopen(req, timeout=15) as r:
-                print(f"[OK] Discord sent: status={r.status}", flush=True)
+                resp = r.read().decode("utf-8")[:200]
+                print(f"[OK] Discord embed sent: status={r.status}, resp={resp}", flush=True)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8")[:500]
+            print(f"[NG] Discord HTTPError: {e.code} {e.reason} | body={body}", flush=True)
         except Exception as e:
             print(f"[NG] Discord failed: {e}", flush=True)
 
@@ -72,9 +79,13 @@ def send_text(text):
                 method="POST"
             )
             with urllib.request.urlopen(req, timeout=15) as r:
-                print(f"[OK] Discord text sent: status={r.status}", flush=True)
+                resp = r.read().decode("utf-8")[:200]
+                print(f"[OK] Discord text sent: status={r.status}, resp={resp}", flush=True)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8")[:500]
+            print(f"[NG] Discord HTTPError: {e.code} {e.reason} | body={body}", flush=True)
         except Exception as e:
-            print(f"[NG] Discord text failed: {e}", flush=True)
+            print(f"[NG] Discord failed: {e}", flush=True)
 
 
 # ===== seen.json =====
@@ -157,7 +168,6 @@ def scrape():
         print("[ERROR] SANNO_ID or SANNO_PASS is empty!", flush=True)
         sys.exit(1)
 
-    # Basic認証用の Authorization ヘッダーを生成
     auth_str = base64.b64encode(f"{SANNO_ID}:{SANNO_PASS}".encode()).decode()
     auth_header = f"Basic {auth_str}"
     print(f"[INFO] Authorization header generated (length={len(auth_header)})", flush=True)
@@ -171,17 +181,15 @@ def scrape():
         )
         page = context.new_page()
 
-        # --- 1. ポータルページにアクセス（Basic認証をAuthorizationヘッダーで通過）---
+        # --- 1. ポータルページにアクセス ---
         print(f"[INFO] Opening {PORTAL_URL}", flush=True)
         page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=45000)
         print(f"[INFO] URL after goto: {page.url}", flush=True)
 
-        # 強制待機（JavaScriptで動的生成されるページ対策）
         print("[INFO] Waiting 5 seconds for page to settle...", flush=True)
         page.wait_for_timeout(5000)
         print(f"[INFO] URL after wait: {page.url}", flush=True)
 
-        # ページのHTMLを必ずログに出力
         html = page.content()
         print(f"[DEBUG] Page HTML length: {len(html)} chars", flush=True)
         preview = html[:2000].replace("\n", " ").replace("  ", " ")
@@ -197,9 +205,8 @@ def scrape():
                 f.write(html)
             print("[DEBUG] Saved debug_01_portal.html/png", flush=True)
 
-        # --- 2. ページの状態を診断 ---
+        # --- 2. ページ診断 ---
         print("[INFO] Diagnosing page state...", flush=True)
-
         has_cain = page.locator("#cain").count() > 0
         has_student_id = SANNO_ID in body_text
         has_login_form = page.locator('form[name="loginForm"]').count() > 0
@@ -209,7 +216,6 @@ def scrape():
 
         print(f"[INFO] has_cain={has_cain}, has_student_id={has_student_id}, has_login_form={has_login_form}, has_userid={has_userid}, has_password={has_password}, links={link_count}", flush=True)
 
-        # ポータルページに入れたか確認
         if not has_cain and not has_student_id:
             print("[ERROR] Failed to enter portal page after Basic auth.", flush=True)
             if DEBUG:
@@ -247,7 +253,7 @@ def scrape():
         try:
             with page.expect_navigation(timeout=15000):
                 cain_link.click()
-            page.wait_for_timeout(5000)  # SSOで自動ログインされるのを待つ
+            page.wait_for_timeout(5000)
             print(f"[INFO] URL after Ca-In: {page.url}", flush=True)
         except Exception as e:
             print(f"[WARN] Ca-In click issue: {e}", flush=True)
@@ -260,7 +266,7 @@ def scrape():
                 f.write(page.content())
             print("[DEBUG] Saved debug_04_cain.html/png", flush=True)
 
-        # --- 4. Ca-Inページ内で「お知らせ」リンクを探す ---
+        # --- 4. 「お知らせ」リンクを探す ---
         print("[INFO] Looking for notice link...", flush=True)
         notice_link = None
 
@@ -344,33 +350,45 @@ def main():
     if FILTER_KEYWORD:
         items = [it for it in items if FILTER_KEYWORD in it["title"] or FILTER_KEYWORD in it.get("meta", "")]
 
+    is_first_run = not seen
+    print(f"[INFO] is_first_run={is_first_run}, items={len(items)}, seen_before={len(seen)}", flush=True)
+
     # 初回：基準登録のみ
-    if not seen:
+    if is_first_run:
         print(f"[INFO] First run! Registering {len(items)} items as baseline.", flush=True)
         for it in items:
             seen.add(it["url"])
         save_seen(seen)
         send_text(f"✅ 産業能率大学ポータル監視を開始したで！（基準登録: {len(items)}件）\nこれから新着があったら通知するわ。")
         print("=== MAIN END (first run) ===", flush=True)
-        return
+    else:
+        # 新着判定
+        new_items = [it for it in items if it["url"] not in seen]
+        print(f"[INFO] New items: {len(new_items)}", flush=True)
 
-    # 新着判定
-    new_items = [it for it in items if it["url"] not in seen]
-    print(f"[INFO] New items: {len(new_items)}", flush=True)
+        if new_items:
+            print(f"[INFO] Sending {len(new_items[:MAX_NOTIFY])} notifications...", flush=True)
+            for it in new_items[:MAX_NOTIFY]:
+                send_discord(it["title"], it["meta"], it["url"], it["is_new"])
+                seen.add(it["url"])
+            save_seen(seen)
+            print(f"=== MAIN END (notified {len(new_items[:MAX_NOTIFY])} items) ===", flush=True)
+        else:
+            print("[INFO] No new notices. Exiting quietly.", flush=True)
+            print("=== MAIN END (no changes) ===", flush=True)
 
-    if not new_items:
-        print("[INFO] No new notices. Exiting quietly.", flush=True)
-        print("=== MAIN END (no changes) ===", flush=True)
-        return
-
-    # 通知
-    print(f"[INFO] Sending {len(new_items[:MAX_NOTIFY])} notifications...", flush=True)
-    for it in new_items[:MAX_NOTIFY]:
-        send_discord(it["title"], it["meta"], it["url"], it["is_new"])
-        seen.add(it["url"])
-
-    save_seen(seen)
-    print(f"=== MAIN END (notified {len(new_items[:MAX_NOTIFY])} items) ===", flush=True)
+    # ===== デバッグ用：毎回実行サマリーをDiscordに送信 =====
+    # 問題解決したらこの部分は消してええで
+    summary = (
+        f"📊 実行サマリー\n"
+        f"- 初回実行: {'Yes' if is_first_run else 'No'}\n"
+        f"- 抽出件数: {len(items)}件\n"
+        f"- 新着件数: {len([it for it in items if it['url'] not in seen]) if not is_first_run else 0}件\n"
+        f"- seen登録数: {len(seen)}件\n"
+        f"- Webhook数: {len(DISCORD_WEBHOOKS)}個"
+    )
+    print(f"[INFO] Sending summary...", flush=True)
+    send_text(summary)
 
 
 if __name__ == "__main__":
