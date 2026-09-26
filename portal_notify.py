@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v15
-- ボタン実クリック + フォーム直接送信でログイン
-- expect_navigationでページ遷移を待つ
+sanno-portal-notify v16
+- buttonName隠しフィールドをセットしてログイン
+- 変更があった時だけDiscordに通知、変わらんかったら通知しない
 """
 
 import os
@@ -191,39 +191,19 @@ def scrape():
             page.fill("#password", SANNO_PASS)
             print("[INFO] Filled ID and password", flush=True)
 
-            # 方法1: ボタンを実際にクリック（onclickイベントが発火する）
-            print("[INFO] Clicking login button...", flush=True)
+            # buttonName隠しフィールドをセットしてからフォーム送信
+            print("[INFO] Setting buttonName and submitting form...", flush=True)
             try:
                 with page.expect_navigation(timeout=15000):
-                    page.locator("#loginButton").click()
-                print(f"[INFO] URL after button click: {page.url}", flush=True)
-            except Exception as e:
-                print(f"[WARN] Button click navigation failed: {e}", flush=True)
-
-            # 方法2: まだログインページやったら、exec()呼んでフォーム送信
-            if is_login_page(page):
-                print("[INFO] Trying exec() + form submit...", flush=True)
-                try:
                     page.evaluate("""() => {
-                        if (typeof exec === 'function') {
-                            exec('login', document.getElementById('loginButtonDummy'), null);
-                        }
+                        document.getElementById('loginButtonDummy').value = 'login';
+                        document.forms['loginForm'].submit();
                     }""")
-                    page.wait_for_timeout(2000)
-                except Exception as e:
-                    print(f"[WARN] exec() failed: {e}", flush=True)
-
-                if is_login_page(page):
-                    # 最終手段: フォームを直接送信
-                    print("[INFO] Submitting form directly...", flush=True)
-                    try:
-                        with page.expect_navigation(timeout=15000):
-                            page.evaluate("document.forms['loginForm'].submit()")
-                        print(f"[INFO] URL after form submit: {page.url}", flush=True)
-                    except Exception as e:
-                        print(f"[WARN] Form submit failed: {e}", flush=True)
-
-            print(f"[INFO] URL after all login attempts: {page.url}", flush=True)
+                print(f"[INFO] URL after form submit: {page.url}", flush=True)
+            except Exception as e:
+                print(f"[WARN] Form submit navigation issue: {e}", flush=True)
+                page.wait_for_load_state("networkidle", timeout=10000)
+                print(f"[INFO] URL after wait: {page.url}", flush=True)
 
             if DEBUG:
                 page.screenshot(path="debug_03_after_login.png", full_page=True)
@@ -335,29 +315,33 @@ def main():
     seen = load_seen()
     items = scrape()
 
+    # フィルター適用
     if FILTER_KEYWORD:
         items = [it for it in items if FILTER_KEYWORD in it["title"] or FILTER_KEYWORD in it.get("meta", "")]
 
-    # 初回：基準登録のみ
+    # ===== 初回実行：基準登録のみ（個別通知はしない） =====
     if not seen:
         print(f"[INFO] First run! Registering {len(items)} items as baseline.", flush=True)
         for it in items:
             seen.add(it["url"])
         save_seen(seen)
-        send_text(f"✅ 産業能率大学ポータルの監視を開始したで！（基準登録: {len(items)}件）")
+        # 初回は「監視開始」だけ通知（個別のお知らせは送らない）
+        send_text(f"✅ 産業能率大学ポータルの監視を開始したで！（基準登録: {len(items)}件）\nこれから新着があったら通知するわ。")
         print("=== MAIN END (first run) ===", flush=True)
         return
 
-    # 新着判定
+    # ===== 2回目以降：新着だけを通知 =====
     new_items = [it for it in items if it["url"] not in seen]
     print(f"[INFO] New items: {len(new_items)}", flush=True)
 
+    # 新着がなかったら何も通知しない（静かに終了）
     if not new_items:
-        print("[INFO] No new notices.", flush=True)
-        print("=== MAIN END (no news) ===", flush=True)
+        print("[INFO] No new notices. Exiting quietly.", flush=True)
+        print("=== MAIN END (no changes) ===", flush=True)
         return
 
-    # 通知
+    # 新着があったら1件ずつ個別通知
+    print(f"[INFO] Sending {len(new_items[:MAX_NOTIFY])} notifications...", flush=True)
     for it in new_items[:MAX_NOTIFY]:
         send_discord(it["title"], it["meta"], it["url"], it["is_new"])
         seen.add(it["url"])
