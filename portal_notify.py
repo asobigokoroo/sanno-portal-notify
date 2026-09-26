@@ -1,115 +1,309 @@
-def scrape_portal():
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+sanno-portal-notify v11
+- top.do にログイン → お知らせページへ遷移
+- 個別のお知らせURLを取得してDiscord通知
+- 新着のみ通知、初回は基準登録
+"""
+
+import os
+import json
+import sys
+import urllib.request
+from urllib.parse import urljoin
+
+print("=" * 50, flush=True)
+print("=== SCRIPT STARTED ===", flush=True)
+print("=" * 50, flush=True)
+
+from playwright.sync_api import sync_playwright
+
+print("=== IMPORT OK ===", flush=True)
+
+# ===== 設定 =====
+TOP_URL = "https://portal-xs.mi.sanno.ac.jp/campusweb/top.do"
+NOTICE_URL = "https://portal-xs.mi.sanno.ac.jp/campusweb/wbasmgjr.do?clearAccessData=true&contenam=wbasmgjr&kjnmnNo=2"
+SEEN_FILE = "seen.json"
+DEBUG = os.environ.get("DEBUG", "0") == "1"
+
+SANNO_ID = os.environ.get("SANNO_ID", "").strip()
+SANNO_PASS = os.environ.get("SANNO_PASS", "").strip()
+DISCORD_WEBHOOKS = [w.strip() for w in os.environ.get("DISCORD_WEBHOOK", "").split(",") if w.strip()]
+FILTER_KEYWORD = os.environ.get("FILTER_KEYWORD", "").strip()
+MAX_NOTIFY = int(os.environ.get("MAX_NOTIFY_PER_RUN", "20"))
+
+print(f"DEBUG={DEBUG}, ID={'set' if SANNO_ID else 'EMPTY'}, PASS={'set' if SANNO_PASS else 'EMPTY'}, WEBHOOKS={len(DISCORD_WEBHOOKS)}", flush=True)
+
+
+# ===== Discord送信 =====
+def send_discord(title, meta, url, is_new=False):
+    color = 0xFF4444 if is_new else 0x1E88E5
+    embed = {
+        "title": title[:250] or "(無題)",
+        "url": url,
+        "description": meta[:500] if meta else None,
+        "color": color,
+        "footer": {"text": "産業能率大学ポータル"}
+    }
+    # descriptionがNoneやったらキーごと消す
+    if not embed["description"]:
+        del embed["description"]
+
+    payload = {"embeds": [embed]}
+    for wh in DISCORD_WEBHOOKS:
+        try:
+            req = urllib.request.Request(
+                wh,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                print(f"[OK] Discord sent: status={r.status}", flush=True)
+        except Exception as e:
+            print(f"[NG] Discord failed: {e}", flush=True)
+
+
+def send_text(text):
+    for wh in DISCORD_WEBHOOKS:
+        try:
+            req = urllib.request.Request(
+                wh,
+                data=json.dumps({"content": text}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                print(f"[OK] Discord text sent: status={r.status}", flush=True)
+        except Exception as e:
+            print(f"[NG] Discord text failed: {e}", flush=True)
+
+
+# ===== seen.json =====
+def load_seen():
+    if not os.path.exists(SEEN_FILE):
+        print(f"[INFO] {SEEN_FILE} not found. First run.", flush=True)
+        return set()
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            data = set(d if isinstance(d, list) else [])
+            print(f"[INFO] loaded seen: {len(data)} items", flush=True)
+            return data
+    except Exception as e:
+        print(f"[WARN] load_seen failed: {e}", flush=True)
+        return set()
+
+
+def save_seen(seen_set):
+    try:
+        with open(SEEN_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(seen_set))[-2000:], f, ensure_ascii=False, indent=2)
+        print(f"[INFO] saved seen: {len(seen_set)} items", flush=True)
+    except Exception as e:
+        print(f"[WARN] save_seen failed: {e}", flush=True)
+
+
+# ===== お知らせ抽出 =====
+def extract_notices(page):
+    items = []
+    rows = page.query_selector_all("table tbody tr, table tr")
+    print(f"[INFO] Found {len(rows)} table rows", flush=True)
+
+    for row in rows:
+        # タイトルセル
+        title_cell = row.query_selector(".camjnext-list-item-contents")
+        if not title_cell:
+            continue
+
+        link = title_cell.query_selector("a")
+        if not link:
+            continue
+
+        title = link.inner_text().strip()
+        if not title or len(title) < 3:
+            continue
+
+        # 個別URLを取得（これが重要！）
+        href = link.get_attribute("href")
+        if href:
+            # 相対URLを絶対URLに変換
+            item_url = urljoin(page.url, href)
+        else:
+            item_url = NOTICE_URL  # fallback
+
+        # 日付・送信者・種別
+        tds = row.query_selector_all("td")
+        date_str = tds[3].inner_text().strip() if len(tds) > 3 else ""
+        sender = tds[4].inner_text().strip() if len(tds) > 4 else ""
+        category = tds[5].inner_text().strip() if len(tds) > 5 else ""
+
+        # NEWタグ
+        new_tag = title_cell.query_selector(".camjnext-list-tag-new")
+        is_new = new_tag is not None
+
+        meta_parts = [p for p in [date_str, sender, category] if p]
+        meta = " / ".join(meta_parts)
+        if is_new:
+            meta += " / 【NEW】"
+
+        items.append({
+            "title": title[:200],
+            "meta": meta,
+            "url": item_url,
+            "is_new": is_new
+        })
+
+    return items
+
+
+# ===== メイン処理 =====
+def scrape():
+    print("=== SCRAPE START ===", flush=True)
     if not SANNO_ID or not SANNO_PASS:
-        print("[error] SANNO_ID / SANNO_PASS 未設定"); sys.exit(1)
+        print("[ERROR] SANNO_ID or SANNO_PASS is empty!", flush=True)
+        sys.exit(1)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            viewport={"width": 1400, "height": 1000})
+            viewport={"width": 1400, "height": 1000}
+        )
         page = context.new_page()
 
-        # --- 1. お知らせページに直接アクセス ---
-        print(f"[portal-notify] open notice list: {NOTICE_URL}")
-        page.goto(NOTICE_URL, wait_until="networkidle", timeout=45000)
-        print(f"[portal-notify] current url: {page.url}")
+        # --- 1. top.do にアクセス ---
+        print(f"[INFO] Opening {TOP_URL}", flush=True)
+        page.goto(TOP_URL, wait_until="networkidle", timeout=45000)
+        print(f"[INFO] URL after top.do: {page.url}", flush=True)
 
         if DEBUG:
-            page.screenshot(path="debug_01_first_access.png", full_page=True)
-            with open("debug_01_first_access.html", "w", encoding="utf-8") as f:
+            page.screenshot(path="debug_01_top.png", full_page=True)
+            with open("debug_01_top.html", "w", encoding="utf-8") as f:
                 f.write(page.content())
-            print("[DEBUG] saved debug_01_first_access.html / .png")
 
-        # --- 2. ページ内にログインフォームがあるかチェック ---
-        # ユーザID入力欄があれば = ログインが必要
-        user_id_input = page.locator("#userId")
-        has_login_form = user_id_input.count() > 0
-
-        if has_login_form:
-            print("[portal-notify] login form detected on page. filling credentials...")
+        # --- 2. ログインフォームがあれば入力 ---
+        if page.locator("#userId").count() > 0:
+            print("[INFO] Login form found. Logging in...", flush=True)
 
             if DEBUG:
-                page.screenshot(path="debug_02_login_form.png", full_page=True)
-                print("[DEBUG] saved debug_02_login_form.png")
+                page.screenshot(path="debug_02_login.png", full_page=True)
 
-            try:
-                # 確実に見つかった要素に入力
-                page.fill("#userId", SANNO_ID)
-                page.fill("#password", SANNO_PASS)
-                page.click("#loginButton")
-                
-                # ログイン後の遷移を待つ
-                page.wait_for_load_state("networkidle", timeout=30000)
-                print(f"[portal-notify] after login url: {page.url}")
+            page.fill("#userId", SANNO_ID)
+            page.fill("#password", SANNO_PASS)
+            page.click("#loginButton")
 
-            except Exception as e:
-                print(f"[error] ログイン送信でエラー: {e}")
-                if DEBUG:
-                    page.screenshot(path="debug_error_submit.png", full_page=True)
-                browser.close()
-                sys.exit(3)
+            page.wait_for_load_state("networkidle", timeout=30000)
+            print(f"[INFO] URL after login: {page.url}", flush=True)
 
-            # ログイン後、再度お知らせページへ
-            if "wbasmgjr" not in page.url:  # お知らせページのURLに含まれる文字列で判定
-                print(f"[portal-notify] re-open notice list after login")
-                page.goto(NOTICE_URL, wait_until="networkidle", timeout=45000)
-                print(f"[portal-notify] current url after re-open: {page.url}")
+            if DEBUG:
+                page.screenshot(path="debug_03_after_login.png", full_page=True)
+                with open("debug_03_after_login.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
 
-            # まだログインフォームが残ってたら失敗
-            if page.locator("#userId").count() > 0:
-                print("[error] ログイン後もフォームが残ってる。ID/PASSが違うかもしれん。")
-                if DEBUG:
-                    page.screenshot(path="debug_error_still_login.png", full_page=True)
-                browser.close()
-                sys.exit(4)
+        # --- 3. お知らせページへ ---
+        print(f"[INFO] Opening notice page: {NOTICE_URL}", flush=True)
+        page.goto(NOTICE_URL, wait_until="networkidle", timeout=45000)
+        print(f"[INFO] URL after notice: {page.url}", flush=True)
 
-        # --- 3. お知らせページのスクショ ---
-        page.wait_for_timeout(4000)
+        # まだログイン画面やったら失敗
+        if page.locator("#userId").count() > 0:
+            print("[ERROR] Still on login page after login! Check ID/PASS.", flush=True)
+            if DEBUG:
+                page.screenshot(path="debug_error_still_login.png", full_page=True)
+            browser.close()
+            sys.exit(2)
+
+        page.wait_for_timeout(3000)
 
         if DEBUG:
-            page.screenshot(path="debug_03_notice_page.png", full_page=True)
-            with open("debug_03_notice_page.html", "w", encoding="utf-8") as f:
+            page.screenshot(path="debug_04_notice.png", full_page=True)
+            with open("debug_04_notice.html", "w", encoding="utf-8") as f:
                 f.write(page.content())
-            preview = page.content()[:1500].replace("\n", " ").replace("  ", " ")
-            print(f"[DEBUG] html_preview={preview}...")
-            rows = page.query_selector_all("table tr")
-            print(f"[DEBUG] total rows: {len(rows)}")
-            for i, row in enumerate(rows[:5]):
-                txt = row.inner_text().replace("\n", " | ")
-                print(f"[DEBUG] row {i}: {txt[:150]}")
+            print("[DEBUG] Saved debug_04_notice.png/html", flush=True)
 
         # --- 4. お知らせ抽出 ---
-        all_items = extract_notices_from_page(page)
+        items = extract_notices(page)
+        print(f"[INFO] Extracted {len(items)} notices", flush=True)
 
-        # ページネーション
+        # ページネーション（次へボタン）
         page_num = 1
-        while len(all_items) < 89 and page_num < 15:
-            next_links = page.query_selector_all("a")
+        while len(items) < 90 and page_num < 10:
             next_btn = None
-            for link in next_links:
+            for link in page.query_selector_all("a"):
                 txt = link.inner_text().strip()
                 if txt in (">", "›", "→", "次へ"):
                     cls = link.get_attribute("class") or ""
                     if "disabled" not in cls and "inactive" not in cls:
                         next_btn = link
                         break
+
             if not next_btn:
                 break
+
             try:
-                print(f"[portal-notify] clicking next page ({page_num + 1})...")
+                print(f"[INFO] Clicking next page ({page_num + 1})...", flush=True)
                 next_btn.click()
                 page.wait_for_timeout(3000)
                 page_num += 1
-                items = extract_notices_from_page(page)
-                if not items:
-                    break
-                existing = {it["title"] for it in all_items}
-                for it in items:
-                    if it["title"] not in existing:
-                        all_items.append(it)
+                new_items = extract_notices(page)
+                existing_urls = {it["url"] for it in items}
+                for it in new_items:
+                    if it["url"] not in existing_urls:
+                        items.append(it)
             except Exception as e:
-                print(f"[warn] pagination failed: {e}")
+                print(f"[WARN] Pagination error: {e}", flush=True)
                 break
 
         browser.close()
-        return all_items
+        print(f"=== SCRAPE DONE: {len(items)} items ===", flush=True)
+        return items
+
+
+def main():
+    print("=== MAIN START ===", flush=True)
+
+    if not DISCORD_WEBHOOKS:
+        print("[ERROR] No Discord webhooks configured!", flush=True)
+        sys.exit(1)
+
+    seen = load_seen()
+    items = scrape()
+
+    # フィルター
+    if FILTER_KEYWORD:
+        items = [it for it in items if FILTER_KEYWORD in it["title"] or FILTER_KEYWORD in it.get("meta", "")]
+
+    # 初回：基準登録のみ
+    if not seen:
+        print(f"[INFO] First run! Registering {len(items)} items as baseline.", flush=True)
+        for it in items:
+            seen.add(it["url"])  # URLで管理する方が確実
+        save_seen(seen)
+        send_text(f"✅ 産業能率大学ポータルの監視を開始したで！（基準登録: {len(items)}件）")
+        print("=== MAIN END (first run) ===", flush=True)
+        return
+
+    # 新着判定（URLで比較）
+    new_items = [it for it in items if it["url"] not in seen]
+    print(f"[INFO] New items: {len(new_items)}", flush=True)
+
+    if not new_items:
+        print("[INFO] No new notices.", flush=True)
+        print("=== MAIN END (no news) ===", flush=True)
+        return
+
+    # 通知
+    for it in new_items[:MAX_NOTIFY]:
+        send_discord(it["title"], it["meta"], it["url"], it["is_new"])
+        seen.add(it["url"])
+
+    save_seen(seen)
+    print(f"=== MAIN END (notified {len(new_items[:MAX_NOTIFY])} items) ===", flush=True)
+
+
+if __name__ == "__main__":
+    print("=== ENTRY POINT ===", flush=True)
+    main()
+    print("=== SCRIPT END ===", flush=True)
