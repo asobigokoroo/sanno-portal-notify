@@ -6,11 +6,10 @@ def scrape_portal():
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            http_credentials={"username": SANNO_ID, "password": SANNO_PASS},  # ← Basic認証用に追加
             viewport={"width": 1400, "height": 1000})
         page = context.new_page()
 
-        # --- 1. お知らせページに直接アクセス（Basic認証で通るかも）---
+        # --- 1. お知らせページに直接アクセス ---
         print(f"[portal-notify] open notice list: {NOTICE_URL}")
         page.goto(NOTICE_URL, wait_until="networkidle", timeout=45000)
         print(f"[portal-notify] current url: {page.url}")
@@ -21,55 +20,28 @@ def scrape_portal():
                 f.write(page.content())
             print("[DEBUG] saved debug_01_first_access.html / .png")
 
-        # --- 2. もしログインページに飛ばされたら、フォームでログイン ---
-        if "signweb" in page.url or "login" in page.url.lower():
-            print("[portal-notify] login page detected. performing form login...")
+        # --- 2. ページ内にログインフォームがあるかチェック ---
+        # ユーザID入力欄があれば = ログインが必要
+        user_id_input = page.locator("#userId")
+        has_login_form = user_id_input.count() > 0
+
+        if has_login_form:
+            print("[portal-notify] login form detected on page. filling credentials...")
 
             if DEBUG:
-                page.screenshot(path="debug_02_login_page.png", full_page=True)
-                with open("debug_02_login_page.html", "w", encoding="utf-8") as f:
-                    f.write(page.content())
-                print("[DEBUG] saved debug_02_login_page.html / .png")
-
-            # フォーム要素を探す
-            id_selectors = [
-                'input[name="j_username"]',
-                'input[name="loginId"]',
-                'input[name="userID"]',
-                'input[name="id"]',
-                'input[type="text"]',
-            ]
-            pass_selectors = [
-                'input[name="j_password"]',
-                'input[name="password"]',
-                'input[type="password"]',
-            ]
-            submit_selectors = [
-                'button[type="submit"]',
-                'input[type="submit"]',
-                'button:has-text("ログイン")',
-                'input[value="ログイン"]',
-            ]
-
-            id_sel = next((s for s in id_selectors if page.locator(s).count() > 0), None)
-            pass_sel = next((s for s in pass_selectors if page.locator(s).count() > 0), None)
-            submit_sel = next((s for s in submit_selectors if page.locator(s).count() > 0), None)
-
-            if not id_sel or not pass_sel or not submit_sel:
-                print("[error] ログインフォームの要素が見つからへん。")
-                print("[error] もしかして：ID/PASSが違うとBasic認証で弾かれて、エラーページが出てるかも")
-                if DEBUG:
-                    page.screenshot(path="debug_error_no_form.png", full_page=True)
-                browser.close()
-                sys.exit(2)
-
-            print(f"[portal-notify] form detected: id={id_sel}, pass={pass_sel}, submit={submit_sel}")
+                page.screenshot(path="debug_02_login_form.png", full_page=True)
+                print("[DEBUG] saved debug_02_login_form.png")
 
             try:
-                page.fill(id_sel, SANNO_ID)
-                page.fill(pass_sel, SANNO_PASS)
-                page.click(submit_sel)
+                # 確実に見つかった要素に入力
+                page.fill("#userId", SANNO_ID)
+                page.fill("#password", SANNO_PASS)
+                page.click("#loginButton")
+                
+                # ログイン後の遷移を待つ
                 page.wait_for_load_state("networkidle", timeout=30000)
+                print(f"[portal-notify] after login url: {page.url}")
+
             except Exception as e:
                 print(f"[error] ログイン送信でエラー: {e}")
                 if DEBUG:
@@ -78,14 +50,16 @@ def scrape_portal():
                 sys.exit(3)
 
             # ログイン後、再度お知らせページへ
-            print(f"[portal-notify] re-open notice list after login")
-            page.goto(NOTICE_URL, wait_until="networkidle", timeout=45000)
-            print(f"[portal-notify] current url after login: {page.url}")
+            if "wbasmgjr" not in page.url:  # お知らせページのURLに含まれる文字列で判定
+                print(f"[portal-notify] re-open notice list after login")
+                page.goto(NOTICE_URL, wait_until="networkidle", timeout=45000)
+                print(f"[portal-notify] current url after re-open: {page.url}")
 
-            if "signweb" in page.url or "login" in page.url.lower():
-                print("[error] ログイン後も認証ページに戻されたで。ID/PASSを確認してな。")
+            # まだログインフォームが残ってたら失敗
+            if page.locator("#userId").count() > 0:
+                print("[error] ログイン後もフォームが残ってる。ID/PASSが違うかもしれん。")
                 if DEBUG:
-                    page.screenshot(path="debug_error_auth.png", full_page=True)
+                    page.screenshot(path="debug_error_still_login.png", full_page=True)
                 browser.close()
                 sys.exit(4)
 
