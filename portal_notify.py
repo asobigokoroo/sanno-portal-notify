@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v14
-- ログイン判定を「form[name="loginForm"]」で行う（#userIdだけだと誤判定するため）
-- top.do にログイン → お知らせリンクをクリックして遷移
+sanno-portal-notify v15
+- ボタン実クリック + フォーム直接送信でログイン
+- expect_navigationでページ遷移を待つ
 """
 
 import os
@@ -121,20 +121,17 @@ def extract_notices(page):
         if not title or len(title) < 3:
             continue
 
-        # 個別URLを取得
         href = link.get_attribute("href")
         if href:
             item_url = urljoin(page.url, href)
         else:
             item_url = NOTICE_URL
 
-        # 日付・送信者・種別
         tds = row.query_selector_all("td")
         date_str = tds[3].inner_text().strip() if len(tds) > 3 else ""
         sender = tds[4].inner_text().strip() if len(tds) > 4 else ""
         category = tds[5].inner_text().strip() if len(tds) > 5 else ""
 
-        # NEWタグ
         new_tag = title_cell.query_selector(".camjnext-list-tag-new")
         is_new = new_tag is not None
 
@@ -153,16 +150,9 @@ def extract_notices(page):
     return items
 
 
-# ===== ログインフォームが表示中か判定 =====
+# ===== ログインフォーム判定 =====
 def is_login_page(page):
-    """ログインフォームが表示されているか（ログインが必要か）を判定"""
-    # form[name="loginForm"] が見えてる = ログインページ
-    login_form = page.locator('form[name="loginForm"]')
-    if login_form.count() > 0:
-        # さらに、フォームが表示されているか（hiddenでないか）も確認
-        is_visible = login_form.first.is_visible()
-        return is_visible
-    return False
+    return page.locator('form[name="loginForm"]').count() > 0 and page.locator('form[name="loginForm"]').first.is_visible()
 
 
 # ===== メイン処理 =====
@@ -190,47 +180,58 @@ def scrape():
             with open("debug_01_top.html", "w", encoding="utf-8") as f:
                 f.write(page.content())
 
-        # --- 2. ログインフォームがあれば入力 ---
-        on_login = is_login_page(page)
-        print(f"[INFO] Login page detected: {on_login}", flush=True)
-
-        if on_login:
-            print("[INFO] Logging in...", flush=True)
+        # --- 2. ログイン ---
+        if is_login_page(page):
+            print("[INFO] Login form found. Logging in...", flush=True)
 
             if DEBUG:
                 page.screenshot(path="debug_02_login.png", full_page=True)
 
             page.fill("#userId", SANNO_ID)
             page.fill("#password", SANNO_PASS)
+            print("[INFO] Filled ID and password", flush=True)
 
-            print("[INFO] Calling exec()...", flush=True)
+            # 方法1: ボタンを実際にクリック（onclickイベントが発火する）
+            print("[INFO] Clicking login button...", flush=True)
             try:
-                result = page.evaluate("""() => {
-                    if (typeof exec === 'function') {
-                        exec('login', document.getElementById('loginButtonDummy'), null);
-                        return 'exec_called';
-                    }
-                    return 'exec_not_found';
-                }""")
-                print(f"[INFO] exec() result: {result}", flush=True)
+                with page.expect_navigation(timeout=15000):
+                    page.locator("#loginButton").click()
+                print(f"[INFO] URL after button click: {page.url}", flush=True)
             except Exception as e:
-                print(f"[WARN] exec() failed: {e}", flush=True)
-                page.evaluate("document.forms['loginForm'].submit()")
-                print("[INFO] Submitted form directly", flush=True)
+                print(f"[WARN] Button click navigation failed: {e}", flush=True)
 
-            page.wait_for_load_state("networkidle", timeout=30000)
-            print(f"[INFO] URL after login: {page.url}", flush=True)
+            # 方法2: まだログインページやったら、exec()呼んでフォーム送信
+            if is_login_page(page):
+                print("[INFO] Trying exec() + form submit...", flush=True)
+                try:
+                    page.evaluate("""() => {
+                        if (typeof exec === 'function') {
+                            exec('login', document.getElementById('loginButtonDummy'), null);
+                        }
+                    }""")
+                    page.wait_for_timeout(2000)
+                except Exception as e:
+                    print(f"[WARN] exec() failed: {e}", flush=True)
+
+                if is_login_page(page):
+                    # 最終手段: フォームを直接送信
+                    print("[INFO] Submitting form directly...", flush=True)
+                    try:
+                        with page.expect_navigation(timeout=15000):
+                            page.evaluate("document.forms['loginForm'].submit()")
+                        print(f"[INFO] URL after form submit: {page.url}", flush=True)
+                    except Exception as e:
+                        print(f"[WARN] Form submit failed: {e}", flush=True)
+
+            print(f"[INFO] URL after all login attempts: {page.url}", flush=True)
 
             if DEBUG:
                 page.screenshot(path="debug_03_after_login.png", full_page=True)
                 with open("debug_03_after_login.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
 
-        # --- 3. ログイン後、まだログインフォームが残ってないか確認 ---
-        still_login = is_login_page(page)
-        print(f"[INFO] Still on login page after login: {still_login}", flush=True)
-
-        if still_login:
+        # --- 3. ログイン成功確認 ---
+        if is_login_page(page):
             print("[ERROR] Login failed! Still on login page. Check ID/PASS.", flush=True)
             if DEBUG:
                 page.screenshot(path="debug_error_login_failed.png", full_page=True)
@@ -239,7 +240,7 @@ def scrape():
 
         print("[INFO] Login successful!", flush=True)
 
-        # --- 4. top.do から「お知らせ」リンクを探してクリック ---
+        # --- 4. お知らせページへ ---
         print("[INFO] Looking for notice link...", flush=True)
 
         notice_selectors = [
@@ -258,10 +259,13 @@ def scrape():
 
         if notice_link:
             print("[INFO] Clicking notice link...", flush=True)
-            notice_link.click()
-            page.wait_for_load_state("networkidle", timeout=30000)
-            page.wait_for_timeout(3000)
-            print(f"[INFO] URL after notice click: {page.url}", flush=True)
+            try:
+                with page.expect_navigation(timeout=15000):
+                    notice_link.click()
+                page.wait_for_timeout(3000)
+                print(f"[INFO] URL after notice click: {page.url}", flush=True)
+            except Exception as e:
+                print(f"[WARN] Notice click failed: {e}", flush=True)
         else:
             print("[WARN] Notice link not found. Trying direct URL...", flush=True)
             page.goto(NOTICE_URL, wait_until="networkidle", timeout=45000)
