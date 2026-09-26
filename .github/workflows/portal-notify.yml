@@ -31,7 +31,7 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Run notifier
+      - name: 通知機能を実行
         env:
           SANNO_ID: ${{ secrets.SANNO_ID }}
           SANNO_PASS: ${{ secrets.SANNO_PASS }}
