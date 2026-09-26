@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v18
-- signweb.mi.sanno.ac.jp/portal/ にアクセス
-- ページ内のログインフォームを探して入力
-- ログイン後、Ca-Inリンクをクリック → お知らせ取得
+sanno-portal-notify v21
+- Basic認証を Authorization ヘッダーで確実に通過
+- ポータル→Ca-In→お知らせ の流れ
 """
 
 import os
 import json
 import sys
+import base64
 import urllib.request
 from urllib.parse import urljoin
 
 print("=" * 50, flush=True)
-print("=== SCRIPT STARTED ===", flush=True)
+print("=== SCRIPT STARTED v21 ===", flush=True)
 print("=" * 50, flush=True)
 
 from playwright.sync_api import sync_playwright
@@ -157,133 +157,65 @@ def scrape():
         print("[ERROR] SANNO_ID or SANNO_PASS is empty!", flush=True)
         sys.exit(1)
 
+    # Basic認証用の Authorization ヘッダーを生成
+    auth_str = base64.b64encode(f"{SANNO_ID}:{SANNO_PASS}".encode()).decode()
+    auth_header = f"Basic {auth_str}"
+    print(f"[INFO] Authorization header generated (length={len(auth_header)})", flush=True)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            extra_http_headers={"Authorization": auth_header},
             viewport={"width": 1400, "height": 1000}
         )
         page = context.new_page()
 
-        # --- 1. ポータルページにアクセス ---
+        # --- 1. ポータルページにアクセス（Basic認証をAuthorizationヘッダーで通過）---
         print(f"[INFO] Opening {PORTAL_URL}", flush=True)
-        page.goto(PORTAL_URL, wait_until="networkidle", timeout=45000)
-        print(f"[INFO] URL after opening: {page.url}", flush=True)
+        page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=45000)
+        print(f"[INFO] URL after goto: {page.url}", flush=True)
+
+        # 強制待機（JavaScriptで動的生成されるページ対策）
+        print("[INFO] Waiting 5 seconds for page to settle...", flush=True)
+        page.wait_for_timeout(5000)
+        print(f"[INFO] URL after wait: {page.url}", flush=True)
+
+        # ページのHTMLを必ずログに出力
+        html = page.content()
+        print(f"[DEBUG] Page HTML length: {len(html)} chars", flush=True)
+        preview = html[:2000].replace("\n", " ").replace("  ", " ")
+        print(f"[DEBUG] HTML preview: {preview}", flush=True)
+
+        body_text = page.locator("body").inner_text() or ""
+        print(f"[DEBUG] Body text length: {len(body_text)} chars", flush=True)
+        print(f"[DEBUG] Body preview: {body_text[:500]}", flush=True)
 
         if DEBUG:
             page.screenshot(path="debug_01_portal.png", full_page=True)
             with open("debug_01_portal.html", "w", encoding="utf-8") as f:
-                f.write(page.content())
+                f.write(html)
             print("[DEBUG] Saved debug_01_portal.html/png", flush=True)
 
         # --- 2. ページの状態を診断 ---
         print("[INFO] Diagnosing page state...", flush=True)
 
-        # 可能性1: すでにログイン済み（Ca-Inリンクがある）
         has_cain = page.locator("#cain").count() > 0
-        has_student_id = SANNO_ID in (page.locator("body").inner_text() or "")
-
-        # 可能性2: ログインフォームがある（portal-xs側のフォーム）
+        has_student_id = SANNO_ID in body_text
         has_login_form = page.locator('form[name="loginForm"]').count() > 0
-        has_userid_field = page.locator("#userId").count() > 0
+        has_userid = page.locator("#userId").count() > 0
+        has_password = page.locator('input[type="password"]').count() > 0
+        link_count = len(page.query_selector_all("a"))
 
-        # 可能性3: 別のログインフォーム（汎用）
-        has_generic_login = page.locator('input[type="password"]').count() > 0
+        print(f"[INFO] has_cain={has_cain}, has_student_id={has_student_id}, has_login_form={has_login_form}, has_userid={has_userid}, has_password={has_password}, links={link_count}", flush=True)
 
-        print(f"[INFO] has_cain_link={has_cain}, has_student_id={has_student_id}, has_login_form={has_login_form}, has_userid={has_userid_field}, has_password_field={has_generic_login}", flush=True)
-
-        # --- 3. ログインが必要なら実行 ---
-        if has_login_form or has_userid_field:
-            print("[INFO] Login form detected. Logging in...", flush=True)
-
-            if DEBUG:
-                page.screenshot(path="debug_02_login.png", full_page=True)
-
-            # 入力欄を探して入力
-            if page.locator("#userId").count() > 0:
-                page.fill("#userId", SANNO_ID)
-                print("[INFO] Filled #userId", flush=True)
-            elif page.locator('input[name="j_username"]').count() > 0:
-                page.fill('input[name="j_username"]', SANNO_ID)
-                print("[INFO] Filled j_username", flush=True)
-            elif page.locator('input[type="text"]').count() > 0:
-                page.fill('input[type="text"]', SANNO_ID)
-                print("[INFO] Filled first text input", flush=True)
-
-            if page.locator("#password").count() > 0:
-                page.fill("#password", SANNO_PASS)
-                print("[INFO] Filled #password", flush=True)
-            elif page.locator('input[name="j_password"]').count() > 0:
-                page.fill('input[name="j_password"]', SANNO_PASS)
-                print("[INFO] Filled j_password", flush=True)
-            elif page.locator('input[type="password"]').count() > 0:
-                page.fill('input[type="password"]', SANNO_PASS)
-                print("[INFO] Filled first password input", flush=True)
-
-            # 送信ボタンを探してクリック
-            print("[INFO] Looking for submit button...", flush=True)
-            submit_selectors = [
-                "#loginButton",
-                'button[type="submit"]',
-                'input[type="submit"]',
-                'button:has-text("ログイン")',
-                'input[value="ログイン"]',
-            ]
-
-            submit_btn = None
-            for sel in submit_selectors:
-                if page.locator(sel).count() > 0:
-                    submit_btn = page.locator(sel).first
-                    print(f"[INFO] Found submit button: {sel}", flush=True)
-                    break
-
-            if submit_btn:
-                try:
-                    with page.expect_navigation(timeout=15000):
-                        submit_btn.click()
-                    print(f"[INFO] URL after click: {page.url}", flush=True)
-                except Exception as e:
-                    print(f"[WARN] Click navigation issue: {e}", flush=True)
-                    page.wait_for_timeout(3000)
-                    print(f"[INFO] URL after wait: {page.url}", flush=True)
-            else:
-                # ボタン見つからんかったらフォーム直接送信
-                print("[INFO] No button found, submitting form directly...", flush=True)
-                try:
-                    with page.expect_navigation(timeout=15000):
-                        page.evaluate("""() => {
-                            var dummy = document.getElementById('loginButtonDummy');
-                            if (dummy) dummy.value = 'login';
-                            var form = document.forms['loginForm'];
-                            if (form) form.submit();
-                        }""")
-                    print(f"[INFO] URL after form submit: {page.url}", flush=True)
-                except Exception as e:
-                    print(f"[WARN] Form submit issue: {e}", flush=True)
-                    page.wait_for_timeout(3000)
-                    print(f"[INFO] URL after wait: {page.url}", flush=True)
-
-            if DEBUG:
-                page.screenshot(path="debug_03_after_login.png", full_page=True)
-                with open("debug_03_after_login.html", "w", encoding="utf-8") as f:
-                    f.write(page.content())
-                print("[DEBUG] Saved debug_03_after_login.html/png", flush=True)
-
-        # --- 4. ログイン後の状態を確認 ---
-        print("[INFO] Checking post-login state...", flush=True)
-        has_cain = page.locator("#cain").count() > 0
-        page_text = page.locator("body").inner_text() or ""
-        has_student_id = SANNO_ID in page_text
-
-        print(f"[INFO] After login - has_cain={has_cain}, has_student_id={has_student_id}", flush=True)
-
+        # ポータルページに入れたか確認
         if not has_cain and not has_student_id:
-            print("[ERROR] Failed to enter portal page. Check ID/PASS or page structure.", flush=True)
+            print("[ERROR] Failed to enter portal page after Basic auth.", flush=True)
             if DEBUG:
                 page.screenshot(path="debug_error_not_portal.png", full_page=True)
-                # ページ内の全リンクを出力してデバッグ
                 links = page.query_selector_all("a")
-                print(f"[DEBUG] All links on page ({len(links)}):", flush=True)
+                print(f"[DEBUG] All links ({len(links)}):", flush=True)
                 for i, link in enumerate(links[:20]):
                     txt = link.inner_text().strip()[:50]
                     href = link.get_attribute("href") or ""
@@ -293,7 +225,7 @@ def scrape():
 
         print("[INFO] Portal page loaded successfully!", flush=True)
 
-        # --- 5. Ca-Inリンクをクリック ---
+        # --- 3. Ca-Inリンクをクリック ---
         print("[INFO] Looking for Ca-In link...", flush=True)
         cain_link = None
 
@@ -315,11 +247,11 @@ def scrape():
         try:
             with page.expect_navigation(timeout=15000):
                 cain_link.click()
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(5000)  # SSOで自動ログインされるのを待つ
             print(f"[INFO] URL after Ca-In: {page.url}", flush=True)
         except Exception as e:
             print(f"[WARN] Ca-In click issue: {e}", flush=True)
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(5000)
             print(f"[INFO] URL after wait: {page.url}", flush=True)
 
         if DEBUG:
@@ -328,7 +260,7 @@ def scrape():
                 f.write(page.content())
             print("[DEBUG] Saved debug_04_cain.html/png", flush=True)
 
-        # --- 6. Ca-Inページ内で「お知らせ」リンクを探す ---
+        # --- 4. Ca-Inページ内で「お知らせ」リンクを探す ---
         print("[INFO] Looking for notice link...", flush=True)
         notice_link = None
 
@@ -361,7 +293,7 @@ def scrape():
                     f.write(page.content())
                 print("[DEBUG] Saved debug_05_notice.html/png", flush=True)
 
-        # --- 7. お知らせ抽出 ---
+        # --- 5. お知らせ抽出 ---
         items = extract_notices(page)
         print(f"[INFO] Extracted {len(items)} notices", flush=True)
 
