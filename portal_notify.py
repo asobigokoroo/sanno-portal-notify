@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v12
-- top.do にログイン → お知らせページへ遷移
-- JavaScriptのexec()関数を使ったログイン対応
-- 個別のお知らせURLを取得してDiscord通知
+sanno-portal-notify v13
+- top.do にログイン → ページ内の「お知らせ」リンクをクリックして遷移
+- セッション維持のため、直接URLを打ち込まずリンクを辿る
 """
 
 import os
@@ -189,7 +188,6 @@ def scrape():
             page.fill("#userId", SANNO_ID)
             page.fill("#password", SANNO_PASS)
 
-            # JavaScriptのexec()関数を使ってログイン
             print("[INFO] Calling exec() via JavaScript...", flush=True)
             try:
                 result = page.evaluate("""() => {
@@ -202,7 +200,6 @@ def scrape():
                 print(f"[INFO] exec() result: {result}", flush=True)
             except Exception as e:
                 print(f"[WARN] exec() failed: {e}", flush=True)
-                # fallback: フォーム直接submit
                 page.evaluate("document.forms['loginForm'].submit()")
                 print("[INFO] Submitted form directly", flush=True)
 
@@ -214,12 +211,8 @@ def scrape():
                 with open("debug_03_after_login.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
 
-        # --- 3. お知らせページへ ---
-        print(f"[INFO] Opening notice page: {NOTICE_URL}", flush=True)
-        page.goto(NOTICE_URL, wait_until="networkidle", timeout=45000)
-        print(f"[INFO] URL after notice: {page.url}", flush=True)
-
-        # まだログイン画面やったら失敗
+        # --- 3. ログイン後の top.do から「お知らせ」リンクを探してクリック ---
+        # まず、現在のページにログインフォームが残ってないか確認
         if page.locator("#userId").count() > 0:
             print("[ERROR] Still on login page after login! Check ID/PASS.", flush=True)
             if DEBUG:
@@ -227,7 +220,44 @@ def scrape():
             browser.close()
             sys.exit(2)
 
-        page.wait_for_timeout(3000)
+        print("[INFO] Login successful! Looking for notice link...", flush=True)
+
+        # 「お知らせ」リンクを探す（複数のパターンを試す）
+        notice_selectors = [
+            'a:has-text("お知らせ")',
+            'a[href*="wbasmgjr"]',
+            'a[onclick*="wbasmgjr"]',
+            '.camjnext-menu-item a',
+        ]
+
+        notice_link = None
+        for sel in notice_selectors:
+            if page.locator(sel).count() > 0:
+                notice_link = page.locator(sel).first
+                print(f"[INFO] Found notice link with selector: {sel}", flush=True)
+                break
+
+        if notice_link:
+            print("[INFO] Clicking notice link...", flush=True)
+            notice_link.click()
+            page.wait_for_load_state("networkidle", timeout=30000)
+            page.wait_for_timeout(3000)
+            print(f"[INFO] URL after clicking notice: {page.url}", flush=True)
+        else:
+            print("[WARN] Notice link not found on top.do. Falling back to direct URL.", flush=True)
+            # fallback: 直接アクセス（セッションが維持されることを祈る）
+            page.goto(NOTICE_URL, wait_until="networkidle", timeout=45000)
+            print(f"[INFO] URL after direct goto: {page.url}", flush=True)
+
+        # お知らせページに来れたか確認
+        if page.locator("#userId").count() > 0:
+            print("[ERROR] Session lost! Redirected to login page.", flush=True)
+            if DEBUG:
+                page.screenshot(path="debug_error_session_lost.png", full_page=True)
+            browser.close()
+            sys.exit(3)
+
+        page.wait_for_timeout(2000)
 
         if DEBUG:
             page.screenshot(path="debug_04_notice.png", full_page=True)
