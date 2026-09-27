@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v29
-- seen.jsonをタイトルベースで管理（URLが全部同じ対策）
-- 個別URLは取れんから、一覧ページへのリンクにする
+sanno-portal-notify v30
+- page.evaluateのnavigationエラーをtry/exceptで捕捉
+- ページ遷移後も正しく処理を続行
 """
 
 import os
@@ -15,7 +15,7 @@ import hashlib
 from urllib.parse import urljoin
 
 print("=" * 50, flush=True)
-print("=== SCRIPT STARTED v29 ===", flush=True)
+print("=== SCRIPT STARTED v30 ===", flush=True)
 print("=" * 50, flush=True)
 
 from playwright.sync_api import sync_playwright
@@ -91,7 +91,7 @@ def send_text(text):
             print(f"[NG] Discord failed: {e}", flush=True)
 
 
-# ===== seen.json（v29: タイトルベース管理） =====
+# ===== seen.json（タイトルベース管理） =====
 def load_seen():
     if not os.path.exists(SEEN_FILE):
         print(f"[INFO] {SEEN_FILE} not found. First run.", flush=True)
@@ -153,13 +153,13 @@ def extract_notices(page, list_url):
             if is_new:
                 meta += " / 【NEW】" if meta else "【NEW】"
 
-            # v29: ユニークIDはタイトルのハッシュ
+            # ユニークIDはタイトルのハッシュ
             item_id = hashlib.md5(title.encode()).hexdigest()[:16]
 
             items.append({
                 "title": title[:200],
                 "meta": meta,
-                "url": list_url,  # 個別URL取れんから一覧ページへ
+                "url": list_url,
                 "item_id": item_id,
                 "is_new": is_new
             })
@@ -216,38 +216,50 @@ def scrape():
         page.wait_for_timeout(5000)
         print(f"[INFO] URL after Ca-In: {page.url}", flush=True)
 
-        # --- 2. 「お知らせ」タブをクリック ---
+        if DEBUG:
+            page.screenshot(path="debug_04_cain.png", full_page=True)
+
+        # --- 2. 「お知らせ」タブをクリック（v30: try/exceptでnavigationエラーを捕捉）---
         print("[INFO] Clicking お知らせ tab...", flush=True)
-        page.evaluate("""() => {
-            if (typeof searchMgsrIcon === 'function') {
-                searchMgsrIcon('03');
-            } else {
-                var links = document.querySelectorAll('a');
-                for (var i = 0; i < links.length; i++) {
-                    if (links[i].innerText.includes('お知らせ')) {
-                        links[i].click();
-                        break;
+        try:
+            page.evaluate("""() => {
+                if (typeof searchMgsrIcon === 'function') {
+                    searchMgsrIcon('03');
+                } else {
+                    var links = document.querySelectorAll('a');
+                    for (var i = 0; i < links.length; i++) {
+                        if (links[i].innerText.includes('お知らせ')) {
+                            links[i].click();
+                            break;
+                        }
                     }
                 }
-            }
-        }""")
+            }""")
+        except Exception as e:
+            print(f"[WARN] Evaluate error (expected due to navigation): {e}", flush=True)
+
+        # navigationが発生した可能性があるので待機
         page.wait_for_timeout(5000)
         list_url = page.url
         print(f"[INFO] URL after お知らせ click: {list_url}", flush=True)
 
-        # --- 3. 表示件数を200件に変更 ---
+        # --- 3. 表示件数を200件に変更（v30: try/exceptでnavigationエラーを捕捉）---
         print("[INFO] Changing display to 200 items...", flush=True)
-        page.evaluate("""() => {
-            if (typeof doPaging === 'function') {
-                doPaging('hojrForm', 'changeStateList', 'pageCount', '', 'maxCount', '200');
-            } else {
-                var select = document.querySelector("select[name='maxDispListCount']");
-                if (select) {
-                    select.value = '200';
-                    select.dispatchEvent(new Event('change', { bubbles: true }));
+        try:
+            page.evaluate("""() => {
+                if (typeof doPaging === 'function') {
+                    doPaging('hojrForm', 'changeStateList', 'pageCount', '', 'maxCount', '200');
+                } else {
+                    var select = document.querySelector("select[name='maxDispListCount']");
+                    if (select) {
+                        select.value = '200';
+                        select.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
                 }
-            }
-        }""")
+            }""")
+        except Exception as e:
+            print(f"[WARN] Evaluate error (expected due to navigation): {e}", flush=True)
+
         page.wait_for_timeout(8000)
         print(f"[INFO] URL after 200 change: {page.url}", flush=True)
 
@@ -319,7 +331,7 @@ def main():
     is_first_run = len(seen) == 0
     print(f"[INFO] is_first_run={is_first_run}, items={len(items)}, seen_before={len(seen)}", flush=True)
 
-    # v29: タイトルのハッシュで新着判定
+    # タイトルのハッシュで新着判定
     item_ids = {it["item_id"] for it in items}
     new_ids = item_ids - seen
     new_items = [it for it in items if it["item_id"] in new_ids]
