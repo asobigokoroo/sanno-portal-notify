@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v30
+sanno-portal-notify v31
 - page.evaluateのnavigationエラーをtry/exceptで捕捉
 - ページ遷移後も正しく処理を続行
+- Discord送信にリトライ（指数バックオフ）を追加
+- 新着が3件以上の時はまとめ通知にする
 """
 
 import os
@@ -12,10 +14,11 @@ import sys
 import base64
 import subprocess
 import hashlib
+import time
 from urllib.parse import urljoin
 
 print("=" * 50, flush=True)
-print("=== SCRIPT STARTED v30 ===", flush=True)
+print("=== SCRIPT STARTED v31 ===", flush=True)
 print("=" * 50, flush=True)
 
 from playwright.sync_api import sync_playwright
@@ -38,7 +41,7 @@ for i, wh in enumerate(DISCORD_WEBHOOKS):
     print(f"  WEBHOOK[{i}]={wh[:50]}...", flush=True)
 
 
-# ===== Discord送信（curl版・Cloudflare対策） =====
+# ===== Discord送信（curl版・Cloudflare対策・リトライ付き） =====
 def send_discord(title, meta, url, is_new=False):
     color = 0xFF4444 if is_new else 0x1E88E5
     embed = {
@@ -53,42 +56,102 @@ def send_discord(title, meta, url, is_new=False):
     payload_json = json.dumps({"embeds": [embed]}, ensure_ascii=False)
 
     for wh in DISCORD_WEBHOOKS:
-        cmd = [
-            "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-            "-H", "Content-Type: application/json",
-            "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "-d", payload_json,
-            wh
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            status = result.stdout.strip()
-            print(f"[OK] Discord embed sent: status={status}", flush=True)
-            if status not in ("200", "201", "204"):
-                print(f"[WARN] Unexpected status: {status}, stderr={result.stderr[:200]}", flush=True)
-        except Exception as e:
-            print(f"[NG] Discord failed: {e}", flush=True)
+        for attempt in range(3):
+            try:
+                cmd = [
+                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                    "-H", "Content-Type: application/json",
+                    "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "-d", payload_json,
+                    wh
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                status = result.stdout.strip()
+                if status in ("200", "201", "204"):
+                    print(f"[OK] Discord embed sent: status={status}", flush=True)
+                    break
+                else:
+                    print(f"[WARN] Unexpected status: {status}, retrying ({attempt+1}/3)...", flush=True)
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+            except Exception as e:
+                print(f"[NG] Discord failed (attempt {attempt+1}/3): {e}", flush=True)
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
 
 
 def send_text(text):
     payload_json = json.dumps({"content": text}, ensure_ascii=False)
 
     for wh in DISCORD_WEBHOOKS:
-        cmd = [
-            "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-            "-H", "Content-Type: application/json",
-            "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "-d", payload_json,
-            wh
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            status = result.stdout.strip()
-            print(f"[OK] Discord text sent: status={status}", flush=True)
-            if status not in ("200", "201", "204"):
-                print(f"[WARN] Unexpected status: {status}, stderr={result.stderr[:200]}", flush=True)
-        except Exception as e:
-            print(f"[NG] Discord failed: {e}", flush=True)
+        for attempt in range(3):
+            try:
+                cmd = [
+                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                    "-H", "Content-Type: application/json",
+                    "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "-d", payload_json,
+                    wh
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                status = result.stdout.strip()
+                if status in ("200", "201", "204"):
+                    print(f"[OK] Discord text sent: status={status}", flush=True)
+                    break
+                else:
+                    print(f"[WARN] Unexpected status: {status}, retrying ({attempt+1}/3)...", flush=True)
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+            except Exception as e:
+                print(f"[NG] Discord failed (attempt {attempt+1}/3): {e}", flush=True)
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+
+
+def send_summary_embed(count, items, list_url):
+    """新着が3件以上ある時、まとめて1つのEmbedにする"""
+    lines = []
+    for i, it in enumerate(items[:10], 1):
+        new_mark = " 🆕" if it["is_new"] else ""
+        lines.append(f"{i}. [{it['title'][:80]}]({list_url}){new_mark}")
+
+    if len(items) > 10:
+        lines.append(f"\n...他 {len(items) - 10} 件")
+
+    description = "\n".join(lines)
+    embed = {
+        "title": f"📢 新着お知らせ {count}件",
+        "url": list_url,
+        "color": 0x00C853,
+        "description": description,
+        "footer": {"text": "産業能率大学ポータル"}
+    }
+
+    payload_json = json.dumps({"embeds": [embed]}, ensure_ascii=False)
+
+    for wh in DISCORD_WEBHOOKS:
+        for attempt in range(3):
+            try:
+                cmd = [
+                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                    "-H", "Content-Type: application/json",
+                    "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "-d", payload_json,
+                    wh
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                status = result.stdout.strip()
+                if status in ("200", "201", "204"):
+                    print(f"[OK] Discord summary sent: status={status}", flush=True)
+                    break
+                else:
+                    print(f"[WARN] Unexpected status: {status}, retrying ({attempt+1}/3)...", flush=True)
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+            except Exception as e:
+                print(f"[NG] Discord summary failed (attempt {attempt+1}/3): {e}", flush=True)
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
 
 
 # ===== seen.json（タイトルベース管理） =====
@@ -149,7 +212,6 @@ def extract_notices(page, list_url):
                         meta_lines.append(line)
                 if meta_lines:
                     meta = " / ".join(meta_lines[-3:])
-
             if is_new:
                 meta += " / 【NEW】" if meta else "【NEW】"
 
@@ -219,7 +281,7 @@ def scrape():
         if DEBUG:
             page.screenshot(path="debug_04_cain.png", full_page=True)
 
-        # --- 2. 「お知らせ」タブをクリック（v30: try/exceptでnavigationエラーを捕捉）---
+        # --- 2. 「お知らせ」タブをクリック ---
         print("[INFO] Clicking お知らせ tab...", flush=True)
         try:
             page.evaluate("""() => {
@@ -238,12 +300,11 @@ def scrape():
         except Exception as e:
             print(f"[WARN] Evaluate error (expected due to navigation): {e}", flush=True)
 
-        # navigationが発生した可能性があるので待機
         page.wait_for_timeout(5000)
         list_url = page.url
         print(f"[INFO] URL after お知らせ click: {list_url}", flush=True)
 
-        # --- 3. 表示件数を200件に変更（v30: try/exceptでnavigationエラーを捕捉）---
+        # --- 3. 表示件数を200件に変更 ---
         print("[INFO] Changing display to 200 items...", flush=True)
         try:
             page.evaluate("""() => {
@@ -351,12 +412,20 @@ def main():
 
         # 新着があれば通知
         if new_items:
-            print(f"[INFO] Sending {len(new_items[:MAX_NOTIFY])} notifications...", flush=True)
+            notify_count = len(new_items[:MAX_NOTIFY])
+            print(f"[INFO] Sending {notify_count} notifications...", flush=True)
+
+            # 3件以上ならまとめ通知、2件以下は個別通知
+            if notify_count >= 3:
+                send_summary_embed(notify_count, new_items[:MAX_NOTIFY], items[0]["url"] if items else PORTAL_URL)
+            else:
+                for it in new_items[:MAX_NOTIFY]:
+                    send_discord(it["title"], it["meta"], it["url"], it["is_new"])
+
             for it in new_items[:MAX_NOTIFY]:
-                send_discord(it["title"], it["meta"], it["url"], it["is_new"])
                 seen.add(it["item_id"])
             save_seen(seen)
-            print(f"=== MAIN END (notified {len(new_items[:MAX_NOTIFY])} items) ===", flush=True)
+            print(f"=== MAIN END (notified {notify_count} items) ===", flush=True)
         else:
             print("[INFO] No new notices. Exiting quietly.", flush=True)
             print("=== MAIN END (no changes) ===", flush=True)
