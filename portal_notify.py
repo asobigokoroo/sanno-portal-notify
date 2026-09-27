@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v23
-- Discord送信を curl（subprocess）に変更（Cloudflare対策）
-- ポータル→Ca-In→お知らせ の流れ
+sanno-portal-notify v24
+- Ca-Inリンクはクリックせず、hrefを取得して直接page.goto()で遷移
+- タイムアウト対策
 """
 
 import os
@@ -14,7 +14,7 @@ import subprocess
 from urllib.parse import urljoin
 
 print("=" * 50, flush=True)
-print("=== SCRIPT STARTED v23 ===", flush=True)
+print("=== SCRIPT STARTED v24 ===", flush=True)
 print("=" * 50, flush=True)
 
 from playwright.sync_api import sync_playwright
@@ -194,12 +194,9 @@ def scrape():
 
         html = page.content()
         print(f"[DEBUG] Page HTML length: {len(html)} chars", flush=True)
-        preview = html[:2000].replace("\n", " ").replace("  ", " ")
-        print(f"[DEBUG] HTML preview: {preview}", flush=True)
 
         body_text = page.locator("body").inner_text() or ""
         print(f"[DEBUG] Body text length: {len(body_text)} chars", flush=True)
-        print(f"[DEBUG] Body preview: {body_text[:500]}", flush=True)
 
         if DEBUG:
             page.screenshot(path="debug_01_portal.png", full_page=True)
@@ -211,56 +208,50 @@ def scrape():
         print("[INFO] Diagnosing page state...", flush=True)
         has_cain = page.locator("#cain").count() > 0
         has_student_id = SANNO_ID in body_text
-        has_login_form = page.locator('form[name="loginForm"]').count() > 0
-        has_userid = page.locator("#userId").count() > 0
-        has_password = page.locator('input[type="password"]').count() > 0
         link_count = len(page.query_selector_all("a"))
 
-        print(f"[INFO] has_cain={has_cain}, has_student_id={has_student_id}, has_login_form={has_login_form}, has_userid={has_userid}, has_password={has_password}, links={link_count}", flush=True)
+        print(f"[INFO] has_cain={has_cain}, has_student_id={has_student_id}, links={link_count}", flush=True)
 
         if not has_cain and not has_student_id:
             print("[ERROR] Failed to enter portal page after Basic auth.", flush=True)
-            if DEBUG:
-                page.screenshot(path="debug_error_not_portal.png", full_page=True)
-                links = page.query_selector_all("a")
-                print(f"[DEBUG] All links ({len(links)}):", flush=True)
-                for i, link in enumerate(links[:20]):
-                    txt = link.inner_text().strip()[:50]
-                    href = link.get_attribute("href") or ""
-                    print(f"  [{i}] {txt} -> {href}", flush=True)
             browser.close()
             sys.exit(2)
 
         print("[INFO] Portal page loaded successfully!", flush=True)
 
-        # --- 3. Ca-Inリンクをクリック ---
-        print("[INFO] Looking for Ca-In link...", flush=True)
-        cain_link = None
+        # --- 3. Ca-Inリンクのhrefを取得して直接遷移（v24変更点）---
+        print("[INFO] Getting Ca-In link URL...", flush=True)
+        cain_href = None
 
-        if page.locator("#cain").count() > 0:
-            cain_link = page.locator("#cain").first
-            print("[INFO] Found Ca-In by #cain", flush=True)
-        elif page.locator('a[href*="camj_pc"]').count() > 0:
-            cain_link = page.locator('a[href*="camj_pc"]').first
-            print("[INFO] Found Ca-In by href", flush=True)
+        cain_elem = page.locator("#cain").first
+        if cain_elem.count() > 0:
+            cain_href = cain_elem.get_attribute("href")
+            print(f"[INFO] Found #cain href: {cain_href}", flush=True)
 
-        if not cain_link:
+        if not cain_href:
+            # フォールバック: hrefにcamj_pcを含むリンクを探す
+            for link in page.query_selector_all("a"):
+                href = link.get_attribute("href") or ""
+                if "camj_pc" in href:
+                    cain_href = href
+                    print(f"[INFO] Found camj_pc href: {cain_href}", flush=True)
+                    break
+
+        if not cain_href:
             print("[ERROR] Ca-In link not found!", flush=True)
             if DEBUG:
                 page.screenshot(path="debug_error_no_cain.png", full_page=True)
             browser.close()
             sys.exit(3)
 
-        print("[INFO] Clicking Ca-In link...", flush=True)
-        try:
-            with page.expect_navigation(timeout=15000):
-                cain_link.click()
-            page.wait_for_timeout(5000)
-            print(f"[INFO] URL after Ca-In: {page.url}", flush=True)
-        except Exception as e:
-            print(f"[WARN] Ca-In click issue: {e}", flush=True)
-            page.wait_for_timeout(5000)
-            print(f"[INFO] URL after wait: {page.url}", flush=True)
+        # 相対URLを絶対URLに変換
+        cain_url = urljoin(page.url, cain_href)
+        print(f"[INFO] Navigating directly to Ca-In: {cain_url}", flush=True)
+
+        # 直接遷移（クリックせず）
+        page.goto(cain_url, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(5000)
+        print(f"[INFO] URL after Ca-In navigation: {page.url}", flush=True)
 
         if DEBUG:
             page.screenshot(path="debug_04_cain.png", full_page=True)
@@ -288,12 +279,14 @@ def scrape():
         if notice_link:
             print("[INFO] Clicking notice link...", flush=True)
             try:
-                with page.expect_navigation(timeout=15000):
+                with page.expect_navigation(timeout=30000):
                     notice_link.click()
                 page.wait_for_timeout(3000)
                 print(f"[INFO] URL after notice: {page.url}", flush=True)
             except Exception as e:
                 print(f"[WARN] Notice click issue: {e}", flush=True)
+                page.wait_for_timeout(3000)
+                print(f"[INFO] URL after wait: {page.url}", flush=True)
 
             if DEBUG:
                 page.screenshot(path="debug_05_notice.png", full_page=True)
