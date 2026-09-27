@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v27
-- 「お知らせ」タブをJavaScriptでクリック
-- 表示件数を200件に変更して1ページで全件取得
-- テーブル構造に合わせて抽出ロジック修正
+sanno-portal-notify v28
+- doPagingを直接JavaScript実行して200件表示に変更
+- ページネーションで残りも取得
 """
 
 import os
@@ -15,7 +14,7 @@ import subprocess
 from urllib.parse import urljoin
 
 print("=" * 50, flush=True)
-print("=== SCRIPT STARTED v27 ===", flush=True)
+print("=== SCRIPT STARTED v28 ===", flush=True)
 print("=" * 50, flush=True)
 
 from playwright.sync_api import sync_playwright
@@ -116,42 +115,43 @@ def save_seen(seen_set):
         print(f"[WARN] save_seen failed: {e}", flush=True)
 
 
-# ===== お知らせ抽出（v27: HTML構造に合わせて修正） =====
+# ===== お知らせ抽出 =====
 def extract_notices(page):
     items = []
-
-    # 方法1: .camjnext-list-item-contents から直接探す
     contents = page.query_selector_all(".camjnext-list-item-contents")
     print(f"[INFO] Found {len(contents)} .camjnext-list-item-contents elements", flush=True)
 
+    seen_titles = set()
+
     for content in contents:
         try:
-            # タイトルリンク
             link = content.query_selector("a")
             if not link:
                 continue
 
             title = link.inner_text().strip()
-            if not title or len(title) < 3:
+            if not title or len(title) < 3 or title in seen_titles:
                 continue
+            seen_titles.add(title)
 
-            # onclickからIDを抽出（selectMsgr(0) → 個別URL生成用）
             onclick = link.get_attribute("onclick") or ""
-            # URLは直接取れんから、ページURLをベースにする
             item_url = page.url
 
-            # NEWタグ
             new_tag = content.query_selector(".camjnext-list-tag-new")
             is_new = new_tag is not None
 
-            # 親のtr/tdから日付・送信者・カテゴリを探す
-            parent = content.evaluate("el => el.closest('tr')?.innerText || el.closest('td')?.innerText || ''") or ""
+            # 親のtrからメタ情報を取得
+            parent_text = content.evaluate("el => el.closest('tr')?.innerText || ''") or ""
             meta = ""
-            if parent:
-                # 親要素のテキストからメタ情報を抽出
-                lines = [l.strip() for l in parent.split("\n") if l.strip() and l.strip() != title]
-                if len(lines) >= 3:
-                    meta = " / ".join(lines[-3:])  # 最後の3要素をメタとして使う
+            if parent_text:
+                lines = [l.strip() for l in parent_text.split("\n") if l.strip() and l.strip() != title]
+                # 日付・送信者・カテゴリを探す
+                meta_lines = []
+                for line in lines:
+                    if any(c in line for c in ["2026/", "2025/", "教務課", "サービス", "センター", "お知らせ", "重要", "休講"]):
+                        meta_lines.append(line)
+                if meta_lines:
+                    meta = " / ".join(meta_lines[-3:])
 
             if is_new:
                 meta += " / 【NEW】" if meta else "【NEW】"
@@ -166,39 +166,7 @@ def extract_notices(page):
             print(f"[WARN] Extract error: {e}", flush=True)
             continue
 
-    if items:
-        print(f"[INFO] Method 1 succeeded: {len(items)} items", flush=True)
-        return items
-
-    # 方法2: 全リンクをスキャン（フォールバック）
-    print(f"[INFO] Method 1 failed. Trying Method 2...", flush=True)
-    all_links = page.query_selector_all("a")
-    seen_titles = set()
-
-    for link in all_links:
-        try:
-            onclick = link.get_attribute("onclick") or ""
-            if "selectMsgr" not in onclick:
-                continue
-
-            title = link.inner_text().strip()
-            if not title or title in seen_titles or len(title) < 3:
-                continue
-            seen_titles.add(title)
-
-            parent = link.evaluate("el => el.parentElement?.innerText || ''") or ""
-            is_new = "NEW" in parent
-
-            items.append({
-                "title": title[:200],
-                "meta": "【NEW】" if is_new else "",
-                "url": page.url,
-                "is_new": is_new
-            })
-        except:
-            continue
-
-    print(f"[INFO] Method 2 result: {len(items)} items", flush=True)
+    print(f"[INFO] Extracted {len(items)} unique notices", flush=True)
     return items
 
 
@@ -222,30 +190,18 @@ def scrape():
         )
         page = context.new_page()
 
-        # --- 1. ポータルページにアクセス ---
+        # --- 1. ポータルページ → Ca-In ---
         print(f"[INFO] Opening {PORTAL_URL}", flush=True)
         page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=45000)
         page.wait_for_timeout(5000)
-        print(f"[INFO] URL after portal: {page.url}", flush=True)
-
-        if DEBUG:
-            page.screenshot(path="debug_01_portal.png", full_page=True)
-
-        # --- 2. Ca-Inリンクのhrefを取得して直接遷移 ---
-        print("[INFO] Getting Ca-In link URL...", flush=True)
-        cain_href = None
 
         cain_elem = page.locator("#cain").first
-        if cain_elem.count() > 0:
-            cain_href = cain_elem.get_attribute("href")
-            print(f"[INFO] Found #cain href: {cain_href}", flush=True)
-
+        cain_href = cain_elem.get_attribute("href") if cain_elem.count() > 0 else None
         if not cain_href:
             for link in page.query_selector_all("a"):
                 href = link.get_attribute("href") or ""
                 if "camj_pc" in href:
                     cain_href = href
-                    print(f"[INFO] Found camj_pc href: {cain_href}", flush=True)
                     break
 
         if not cain_href:
@@ -255,59 +211,46 @@ def scrape():
 
         cain_url = urljoin(page.url, cain_href)
         print(f"[INFO] Navigating to Ca-In: {cain_url}", flush=True)
-
         page.goto(cain_url, wait_until="domcontentloaded", timeout=45000)
         page.wait_for_timeout(5000)
         print(f"[INFO] URL after Ca-In: {page.url}", flush=True)
 
         if DEBUG:
             page.screenshot(path="debug_04_cain.png", full_page=True)
-            with open("debug_04_cain.html", "w", encoding="utf-8") as f:
-                f.write(page.content())
-            print("[DEBUG] Saved debug_04_cain.html/png", flush=True)
 
-        # --- 3. 「お知らせ」タブをJavaScriptでクリック（v27最重要）---
-        print("[INFO] Clicking 'お知らせ' tab via JavaScript...", flush=True)
-        try:
-            page.evaluate("""() => {
-                if (typeof searchMgsrIcon === 'function') {
-                    searchMgsrIcon('03');
-                } else {
-                    // searchMgsrIconが見つからん場合は、テキストで探してクリック
-                    var links = document.querySelectorAll('a');
-                    for (var i = 0; i < links.length; i++) {
-                        if (links[i].innerText.includes('お知らせ')) {
-                            links[i].click();
-                            break;
-                        }
+        # --- 2. 「お知らせ」タブをクリック ---
+        print("[INFO] Clicking お知らせ tab...", flush=True)
+        page.evaluate("""() => {
+            if (typeof searchMgsrIcon === 'function') {
+                searchMgsrIcon('03');
+            } else {
+                var links = document.querySelectorAll('a');
+                for (var i = 0; i < links.length; i++) {
+                    if (links[i].innerText.includes('お知らせ')) {
+                        links[i].click();
+                        break;
                     }
                 }
-            }""")
-            page.wait_for_timeout(3000)
-            print(f"[INFO] URL after clicking お知らせ tab: {page.url}", flush=True)
-        except Exception as e:
-            print(f"[WARN] Tab click error: {e}", flush=True)
+            }
+        }""")
+        page.wait_for_timeout(5000)
+        print(f"[INFO] URL after お知らせ click: {page.url}", flush=True)
 
-        # --- 4. 表示件数を200件に変更（v27最重要）---
-        print("[INFO] Changing display count to 200...", flush=True)
-        try:
-            select = page.query_selector("select[name='maxDispListCount']")
-            if select:
-                select.select_option("200")
-                page.wait_for_timeout(3000)
-                print(f"[INFO] Changed to 200 items display", flush=True)
-            else:
-                print(f"[WARN] Select not found, trying JavaScript...", flush=True)
-                page.evaluate("""() => {
-                    var select = document.querySelector("select[name='maxDispListCount']");
-                    if (select) {
-                        select.value = "200";
-                        select.dispatchEvent(new Event('change'));
-                    }
-                }""")
-                page.wait_for_timeout(3000)
-        except Exception as e:
-            print(f"[WARN] Display count change error: {e}", flush=True)
+        # --- 3. 表示件数を200件に変更（v28: doPagingを直接呼ぶ）---
+        print("[INFO] Changing display to 200 items...", flush=True)
+        page.evaluate("""() => {
+            if (typeof doPaging === 'function') {
+                doPaging('hojrForm', 'changeStateList', 'pageCount', '', 'maxCount', '200');
+            } else {
+                var select = document.querySelector("select[name='maxDispListCount']");
+                if (select) {
+                    select.value = '200';
+                    select.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }
+        }""")
+        page.wait_for_timeout(8000)  # ページ再読み込み待ち
+        print(f"[INFO] URL after changing to 200: {page.url}", flush=True)
 
         if DEBUG:
             page.screenshot(path="debug_05_notice.png", full_page=True)
@@ -315,13 +258,53 @@ def scrape():
                 f.write(page.content())
             print("[DEBUG] Saved debug_05_notice.html/png", flush=True)
 
-        # --- 5. お知らせ抽出 ---
-        items = extract_notices(page)
-        print(f"[INFO] Extracted {len(items)} notices", flush=True)
+        # --- 4. お知らせ抽出 ---
+        all_items = extract_notices(page)
+        print(f"[INFO] Page 1: {len(all_items)} items", flush=True)
+
+        # --- 5. ページネーション（200件でも全部入らん場合）---
+        page_num = 1
+        while len(all_items) < 90 and page_num < 10:
+            # 「次へ」ボタンを探す
+            next_found = False
+            for link in page.query_selector_all("a"):
+                try:
+                    cls = link.get_attribute("class") or ""
+                    onclick = link.get_attribute("onclick") or ""
+                    # 次へボタン: classにnextまたはonclickにdoPaging(...pageCount,'2'...)
+                    if ("camjnext-pagination-next" in cls or 
+                        ("doPaging" in onclick and f"'{page_num + 1}'" in onclick)):
+                        # disabledチェック
+                        if "disabled" in cls or link.is_disabled():
+                            print(f"[INFO] Next button is disabled. End of pages.", flush=True)
+                            next_found = False
+                            break
+                        print(f"[INFO] Clicking next page ({page_num + 1})...", flush=True)
+                        link.click()
+                        page.wait_for_timeout(5000)
+                        page_num += 1
+                        next_found = True
+
+                        new_items = extract_notices(page)
+                        existing_titles = {it["title"] for it in all_items}
+                        added = 0
+                        for it in new_items:
+                            if it["title"] not in existing_titles:
+                                all_items.append(it)
+                                existing_titles.add(it["title"])
+                                added += 1
+                        print(f"[INFO] Page {page_num}: added {added} items (total: {len(all_items)})", flush=True)
+                        break
+                except:
+                    continue
+
+            if not next_found:
+                print(f"[INFO] No more next button. Stopping pagination.", flush=True)
+                break
 
         browser.close()
-        print(f"=== SCRAPE DONE: {len(items)} items ===", flush=True)
-        return items
+        print(f"=== SCRAPE DONE: {len(all_items)} items ===", flush=True)
+        return all_items
 
 
 def main():
