@@ -26,13 +26,17 @@ jobs:
 
       - name: Run script
         env:
+          SANNO_ID: ${{ secrets.SANNO_ID }}
+          SANNO_PASS: ${{ secrets.SANNO_PASS }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DEBUG: "true"
         run: |
-          curl -X POST \
-            -H "Content-Type: application/json" \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-            -d '{"content":"🧪 curlテストやで！"}' \
-            "${DISCORD_WEBHOOK}"
+          echo "=== ファイル確認 ==="
+          ls -la portal_notify.py
+          wc -l portal_notify.py
+          head -n 5 portal_notify.py
+          echo "=== 実行開始 ==="
+          python portal_notify.py
 
       - name: Upload debug artifacts
         if: always()
