@@ -24,19 +24,12 @@ jobs:
           pip install playwright
           playwright install chromium
 
-      - name: Run script
+   - name: Run script
         env:
-          SANNO_ID: ${{ secrets.SANNO_ID }}
-          SANNO_PASS: ${{ secrets.SANNO_PASS }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          DEBUG: "true"
         run: |
-          echo "=== ファイル確認 ==="
-          ls -la portal_notify.py
-          wc -l portal_notify.py
-          head -n 5 portal_notify.py
-          echo "=== 実行開始 ==="
-          python portal_notify.py
+          echo "=== テスト実行 ==="
+          python test_discord.py
 
       - name: Upload debug artifacts
         if: always()
