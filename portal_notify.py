@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v22
-- 毎回実行サマリーをDiscordに送信（デバッグ用）
-- Discordエラーレスポンスを詳細出力
+sanno-portal-notify v23
+- Discord送信を curl（subprocess）に変更（Cloudflare対策）
+- ポータル→Ca-In→お知らせ の流れ
 """
 
 import os
 import json
 import sys
 import base64
-import urllib.request
-import urllib.error
+import subprocess
 from urllib.parse import urljoin
 
 print("=" * 50, flush=True)
-print("=== SCRIPT STARTED v22 ===", flush=True)
+print("=== SCRIPT STARTED v23 ===", flush=True)
 print("=" * 50, flush=True)
 
 from playwright.sync_api import sync_playwright
@@ -38,7 +37,7 @@ for i, wh in enumerate(DISCORD_WEBHOOKS):
     print(f"  WEBHOOK[{i}]={wh[:50]}...", flush=True)
 
 
-# ===== Discord送信（エラー詳細版） =====
+# ===== Discord送信（curl版・Cloudflare対策） =====
 def send_discord(title, meta, url, is_new=False):
     color = 0xFF4444 if is_new else 0x1E88E5
     embed = {
@@ -50,40 +49,43 @@ def send_discord(title, meta, url, is_new=False):
     if meta:
         embed["description"] = meta[:500]
 
-    payload = {"embeds": [embed]}
+    payload_json = json.dumps({"embeds": [embed]}, ensure_ascii=False)
+
     for wh in DISCORD_WEBHOOKS:
+        cmd = [
+            "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+            "-H", "Content-Type: application/json",
+            "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "-d", payload_json,
+            wh
+        ]
         try:
-            req = urllib.request.Request(
-                wh,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=15) as r:
-                resp = r.read().decode("utf-8")[:200]
-                print(f"[OK] Discord embed sent: status={r.status}, resp={resp}", flush=True)
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8")[:500]
-            print(f"[NG] Discord HTTPError: {e.code} {e.reason} | body={body}", flush=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            status = result.stdout.strip()
+            print(f"[OK] Discord embed sent: status={status}", flush=True)
+            if status not in ("200", "201", "204"):
+                print(f"[WARN] Unexpected status: {status}, stderr={result.stderr[:200]}", flush=True)
         except Exception as e:
             print(f"[NG] Discord failed: {e}", flush=True)
 
 
 def send_text(text):
+    payload_json = json.dumps({"content": text}, ensure_ascii=False)
+
     for wh in DISCORD_WEBHOOKS:
+        cmd = [
+            "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+            "-H", "Content-Type: application/json",
+            "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "-d", payload_json,
+            wh
+        ]
         try:
-            req = urllib.request.Request(
-                wh,
-                data=json.dumps({"content": text}).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=15) as r:
-                resp = r.read().decode("utf-8")[:200]
-                print(f"[OK] Discord text sent: status={r.status}, resp={resp}", flush=True)
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8")[:500]
-            print(f"[NG] Discord HTTPError: {e.code} {e.reason} | body={body}", flush=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            status = result.stdout.strip()
+            print(f"[OK] Discord text sent: status={status}", flush=True)
+            if status not in ("200", "201", "204"):
+                print(f"[WARN] Unexpected status: {status}, stderr={result.stderr[:200]}", flush=True)
         except Exception as e:
             print(f"[NG] Discord failed: {e}", flush=True)
 
@@ -376,19 +378,6 @@ def main():
         else:
             print("[INFO] No new notices. Exiting quietly.", flush=True)
             print("=== MAIN END (no changes) ===", flush=True)
-
-    # ===== デバッグ用：毎回実行サマリーをDiscordに送信 =====
-    # 問題解決したらこの部分は消してええで
-    summary = (
-        f"📊 実行サマリー\n"
-        f"- 初回実行: {'Yes' if is_first_run else 'No'}\n"
-        f"- 抽出件数: {len(items)}件\n"
-        f"- 新着件数: {len([it for it in items if it['url'] not in seen]) if not is_first_run else 0}件\n"
-        f"- seen登録数: {len(seen)}件\n"
-        f"- Webhook数: {len(DISCORD_WEBHOOKS)}個"
-    )
-    print(f"[INFO] Sending summary...", flush=True)
-    send_text(summary)
 
 
 if __name__ == "__main__":
