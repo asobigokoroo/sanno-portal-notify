@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright
+          pip install -r requirements.txt
           playwright install chromium
 
       - name: Run script
@@ -41,7 +41,7 @@ jobs:
           SANNO_ID: ${{ secrets.SANNO_ID }}
           SANNO_PASS: ${{ secrets.SANNO_PASS }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          DEBUG: "true"
+          DEBUG: "false"
         run: |
           echo "=== ファイル確認 ==="
           ls -la portal_notify.py
