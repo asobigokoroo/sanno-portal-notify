@@ -6,6 +6,7 @@ sanno-portal-notify v31
 - ページ遷移後も正しく処理を続行
 - Discord送信にリトライ（指数バックオフ）を追加
 - 新着が3件以上の時はまとめ通知にする
+- 【重要】【休講】【注目】タグで色分け
 """
 
 import os
@@ -40,10 +41,27 @@ print(f"DEBUG={DEBUG}, ID={'set' if SANNO_ID else 'EMPTY'}, PASS={'set' if SANNO
 for i, wh in enumerate(DISCORD_WEBHOOKS):
     print(f"  WEBHOOK[{i}]={wh[:50]}...", flush=True)
 
+# ===== タグ色分け設定 =====
+TAG_COLORS = {
+    "重要": 0xFF0000,   # 赤
+    "休講": 0xFF8800,   # オレンジ
+    "注目": 0x9C27B0,   # 紫
+}
+TAG_EMOJI = {
+    "重要": "🚨",
+    "休講": "📛",
+    "注目": "👀",
+}
 
 # ===== Discord送信（curl版・Cloudflare対策・リトライ付き） =====
-def send_discord(title, meta, url, is_new=False):
-    color = 0xFF4444 if is_new else 0x1E88E5
+def send_discord(title, meta, url, is_new=False, tag=""):
+    if tag and tag in TAG_COLORS:
+        color = TAG_COLORS[tag]
+    elif is_new:
+        color = 0x00C853
+    else:
+        color = 0x1E88E5
+
     embed = {
         "title": title[:250] or "(無題)",
         "url": url,
@@ -112,8 +130,12 @@ def send_summary_embed(count, items, list_url):
     """新着が3件以上ある時、まとめて1つのEmbedにする"""
     lines = []
     for i, it in enumerate(items[:10], 1):
-        new_mark = " 🆕" if it["is_new"] else ""
-        lines.append(f"{i}. [{it['title'][:80]}]({list_url}){new_mark}")
+        emoji = ""
+        if it.get("tag") and it["tag"] in TAG_EMOJI:
+            emoji = TAG_EMOJI[it["tag"]]
+        elif it["is_new"]:
+            emoji = "🆕"
+        lines.append(f"{i}. [{it['title'][:80]}]({list_url}) {emoji}")
 
     if len(items) > 10:
         lines.append(f"\n...他 {len(items) - 10} 件")
@@ -215,6 +237,15 @@ def extract_notices(page, list_url):
             if is_new:
                 meta += " / 【NEW】" if meta else "【NEW】"
 
+            # タグ検出
+            tag = ""
+            if "【重要】" in title or "[重要]" in title:
+                tag = "重要"
+            elif "休講" in title:
+                tag = "休講"
+            elif "【注目】" in title or "[注目]" in title:
+                tag = "注目"
+
             # ユニークIDはタイトルのハッシュ
             item_id = hashlib.md5(title.encode()).hexdigest()[:16]
 
@@ -223,7 +254,8 @@ def extract_notices(page, list_url):
                 "meta": meta,
                 "url": list_url,
                 "item_id": item_id,
-                "is_new": is_new
+                "is_new": is_new,
+                "tag": tag,
             })
         except Exception as e:
             print(f"[WARN] Extract error: {e}", flush=True)
@@ -420,7 +452,7 @@ def main():
                 send_summary_embed(notify_count, new_items[:MAX_NOTIFY], items[0]["url"] if items else PORTAL_URL)
             else:
                 for it in new_items[:MAX_NOTIFY]:
-                    send_discord(it["title"], it["meta"], it["url"], it["is_new"])
+                    send_discord(it["title"], it["meta"], it["url"], it["is_new"], it.get("tag", ""))
 
             for it in new_items[:MAX_NOTIFY]:
                 seen.add(it["item_id"])
