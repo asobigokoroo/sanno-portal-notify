@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v28
-- doPagingを直接JavaScript実行して200件表示に変更
-- ページネーションで残りも取得
+sanno-portal-notify v29
+- seen.jsonをタイトルベースで管理（URLが全部同じ対策）
+- 個別URLは取れんから、一覧ページへのリンクにする
 """
 
 import os
@@ -11,10 +11,11 @@ import json
 import sys
 import base64
 import subprocess
+import hashlib
 from urllib.parse import urljoin
 
 print("=" * 50, flush=True)
-print("=== SCRIPT STARTED v28 ===", flush=True)
+print("=== SCRIPT STARTED v29 ===", flush=True)
 print("=" * 50, flush=True)
 
 from playwright.sync_api import sync_playwright
@@ -90,7 +91,7 @@ def send_text(text):
             print(f"[NG] Discord failed: {e}", flush=True)
 
 
-# ===== seen.json =====
+# ===== seen.json（v29: タイトルベース管理） =====
 def load_seen():
     if not os.path.exists(SEEN_FILE):
         print(f"[INFO] {SEEN_FILE} not found. First run.", flush=True)
@@ -116,7 +117,7 @@ def save_seen(seen_set):
 
 
 # ===== お知らせ抽出 =====
-def extract_notices(page):
+def extract_notices(page, list_url):
     items = []
     contents = page.query_selector_all(".camjnext-list-item-contents")
     print(f"[INFO] Found {len(contents)} .camjnext-list-item-contents elements", flush=True)
@@ -134,9 +135,6 @@ def extract_notices(page):
                 continue
             seen_titles.add(title)
 
-            onclick = link.get_attribute("onclick") or ""
-            item_url = page.url
-
             new_tag = content.query_selector(".camjnext-list-tag-new")
             is_new = new_tag is not None
 
@@ -145,7 +143,6 @@ def extract_notices(page):
             meta = ""
             if parent_text:
                 lines = [l.strip() for l in parent_text.split("\n") if l.strip() and l.strip() != title]
-                # 日付・送信者・カテゴリを探す
                 meta_lines = []
                 for line in lines:
                     if any(c in line for c in ["2026/", "2025/", "教務課", "サービス", "センター", "お知らせ", "重要", "休講"]):
@@ -156,10 +153,14 @@ def extract_notices(page):
             if is_new:
                 meta += " / 【NEW】" if meta else "【NEW】"
 
+            # v29: ユニークIDはタイトルのハッシュ
+            item_id = hashlib.md5(title.encode()).hexdigest()[:16]
+
             items.append({
                 "title": title[:200],
                 "meta": meta,
-                "url": item_url,
+                "url": list_url,  # 個別URL取れんから一覧ページへ
+                "item_id": item_id,
                 "is_new": is_new
             })
         except Exception as e:
@@ -190,7 +191,7 @@ def scrape():
         )
         page = context.new_page()
 
-        # --- 1. ポータルページ → Ca-In ---
+        # --- 1. ポータル → Ca-In ---
         print(f"[INFO] Opening {PORTAL_URL}", flush=True)
         page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=45000)
         page.wait_for_timeout(5000)
@@ -215,9 +216,6 @@ def scrape():
         page.wait_for_timeout(5000)
         print(f"[INFO] URL after Ca-In: {page.url}", flush=True)
 
-        if DEBUG:
-            page.screenshot(path="debug_04_cain.png", full_page=True)
-
         # --- 2. 「お知らせ」タブをクリック ---
         print("[INFO] Clicking お知らせ tab...", flush=True)
         page.evaluate("""() => {
@@ -234,9 +232,10 @@ def scrape():
             }
         }""")
         page.wait_for_timeout(5000)
-        print(f"[INFO] URL after お知らせ click: {page.url}", flush=True)
+        list_url = page.url
+        print(f"[INFO] URL after お知らせ click: {list_url}", flush=True)
 
-        # --- 3. 表示件数を200件に変更（v28: doPagingを直接呼ぶ）---
+        # --- 3. 表示件数を200件に変更 ---
         print("[INFO] Changing display to 200 items...", flush=True)
         page.evaluate("""() => {
             if (typeof doPaging === 'function') {
@@ -249,8 +248,8 @@ def scrape():
                 }
             }
         }""")
-        page.wait_for_timeout(8000)  # ページ再読み込み待ち
-        print(f"[INFO] URL after changing to 200: {page.url}", flush=True)
+        page.wait_for_timeout(8000)
+        print(f"[INFO] URL after 200 change: {page.url}", flush=True)
 
         if DEBUG:
             page.screenshot(path="debug_05_notice.png", full_page=True)
@@ -259,24 +258,21 @@ def scrape():
             print("[DEBUG] Saved debug_05_notice.html/png", flush=True)
 
         # --- 4. お知らせ抽出 ---
-        all_items = extract_notices(page)
+        all_items = extract_notices(page, list_url)
         print(f"[INFO] Page 1: {len(all_items)} items", flush=True)
 
-        # --- 5. ページネーション（200件でも全部入らん場合）---
+        # --- 5. ページネーション ---
         page_num = 1
         while len(all_items) < 90 and page_num < 10:
-            # 「次へ」ボタンを探す
             next_found = False
             for link in page.query_selector_all("a"):
                 try:
                     cls = link.get_attribute("class") or ""
                     onclick = link.get_attribute("onclick") or ""
-                    # 次へボタン: classにnextまたはonclickにdoPaging(...pageCount,'2'...)
                     if ("camjnext-pagination-next" in cls or 
                         ("doPaging" in onclick and f"'{page_num + 1}'" in onclick)):
-                        # disabledチェック
                         if "disabled" in cls or link.is_disabled():
-                            print(f"[INFO] Next button is disabled. End of pages.", flush=True)
+                            print(f"[INFO] Next button disabled. End.", flush=True)
                             next_found = False
                             break
                         print(f"[INFO] Clicking next page ({page_num + 1})...", flush=True)
@@ -285,13 +281,13 @@ def scrape():
                         page_num += 1
                         next_found = True
 
-                        new_items = extract_notices(page)
-                        existing_titles = {it["title"] for it in all_items}
+                        new_items = extract_notices(page, list_url)
+                        existing_ids = {it["item_id"] for it in all_items}
                         added = 0
                         for it in new_items:
-                            if it["title"] not in existing_titles:
+                            if it["item_id"] not in existing_ids:
                                 all_items.append(it)
-                                existing_titles.add(it["title"])
+                                existing_ids.add(it["item_id"])
                                 added += 1
                         print(f"[INFO] Page {page_num}: added {added} items (total: {len(all_items)})", flush=True)
                         break
@@ -299,7 +295,7 @@ def scrape():
                     continue
 
             if not next_found:
-                print(f"[INFO] No more next button. Stopping pagination.", flush=True)
+                print(f"[INFO] No more pages.", flush=True)
                 break
 
         browser.close()
@@ -320,32 +316,37 @@ def main():
     if FILTER_KEYWORD:
         items = [it for it in items if FILTER_KEYWORD in it["title"] or FILTER_KEYWORD in it.get("meta", "")]
 
-    is_first_run = not seen
+    is_first_run = len(seen) == 0
     print(f"[INFO] is_first_run={is_first_run}, items={len(items)}, seen_before={len(seen)}", flush=True)
+
+    # v29: タイトルのハッシュで新着判定
+    item_ids = {it["item_id"] for it in items}
+    new_ids = item_ids - seen
+    new_items = [it for it in items if it["item_id"] in new_ids]
+
+    print(f"[INFO] Total items: {len(items)}, New items: {len(new_items)}", flush=True)
 
     # 初回：基準登録のみ
     if is_first_run:
         print(f"[INFO] First run! Registering {len(items)} items as baseline.", flush=True)
         for it in items:
-            seen.add(it["url"])
+            seen.add(it["item_id"])
         save_seen(seen)
         send_text(f"✅ 産業能率大学ポータル監視を開始したで！\nこれから新着があったら通知するわ。")
         print("=== MAIN END (first run) ===", flush=True)
-    else:
-        # 新着判定
-        new_items = [it for it in items if it["url"] not in seen]
-        print(f"[INFO] New items: {len(new_items)}", flush=True)
+        return
 
-        if new_items:
-            print(f"[INFO] Sending {len(new_items[:MAX_NOTIFY])} notifications...", flush=True)
-            for it in new_items[:MAX_NOTIFY]:
-                send_discord(it["title"], it["meta"], it["url"], it["is_new"])
-                seen.add(it["url"])
-            save_seen(seen)
-            print(f"=== MAIN END (notified {len(new_items[:MAX_NOTIFY])} items) ===", flush=True)
-        else:
-            print("[INFO] No new notices. Exiting quietly.", flush=True)
-            print("=== MAIN END (no changes) ===", flush=True)
+    # 新着があれば通知
+    if new_items:
+        print(f"[INFO] Sending {len(new_items[:MAX_NOTIFY])} notifications...", flush=True)
+        for it in new_items[:MAX_NOTIFY]:
+            send_discord(it["title"], it["meta"], it["url"], it["is_new"])
+            seen.add(it["item_id"])
+        save_seen(seen)
+        print(f"=== MAIN END (notified {len(new_items[:MAX_NOTIFY])} items) ===", flush=True)
+    else:
+        print("[INFO] No new notices. Exiting quietly.", flush=True)
+        print("=== MAIN END (no changes) ===", flush=True)
 
 
 if __name__ == "__main__":
