@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Discord Webhook動作確認"""
+"""Discord Webhook動作確認（User-Agent偽装版）"""
 
 import os
 import json
@@ -16,12 +16,18 @@ if not WEBHOOK:
 
 print(f"WEBHOOK prefix={WEBHOOK[:50]}...")
 
-# テスト送信（シンプルなテキスト）
+# User-Agentをブラウザに偽装
+HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+}
+
+# テスト送信
 try:
     req = urllib.request.Request(
         WEBHOOK,
-        data=json.dumps({"content": "🧪 Webhookテストやで！"}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        data=json.dumps({"content": "🧪 User-Agent偽装テストやで！"}).encode("utf-8"),
+        headers=HEADERS,
         method="POST"
     )
     with urllib.request.urlopen(req, timeout=15) as r:
