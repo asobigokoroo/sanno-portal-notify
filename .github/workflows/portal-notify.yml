@@ -24,7 +24,7 @@ jobs:
           pip install playwright
           playwright install chromium
 
-   - name: Run script
+      - name: Run script
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
