@@ -28,8 +28,11 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
-          echo "=== テスト実行 ==="
-          python test_discord.py
+          curl -X POST \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+            -d '{"content":"🧪 curlテストやで！"}' \
+            "${DISCORD_WEBHOOK}"
 
       - name: Upload debug artifacts
         if: always()
