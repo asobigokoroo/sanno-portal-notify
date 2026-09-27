@@ -2,7 +2,7 @@ name: SANNOポータル通知
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "5,35 8-22 * * *"
   workflow_dispatch:
 
 permissions:
@@ -68,3 +68,4 @@ jobs:
             debug_*.png
             seen.json
           if-no-files-found: ignore
+          retention-days: 7
