@@ -322,43 +322,50 @@ def main():
         print("[ERROR] No Discord webhooks configured!", flush=True)
         sys.exit(1)
 
-    seen = load_seen()
-    items = scrape()
+    try:
+        seen = load_seen()
+        items = scrape()
 
-    if FILTER_KEYWORD:
-        items = [it for it in items if FILTER_KEYWORD in it["title"] or FILTER_KEYWORD in it.get("meta", "")]
+        if FILTER_KEYWORD:
+            items = [it for it in items if FILTER_KEYWORD in it["title"] or FILTER_KEYWORD in it.get("meta", "")]
 
-    is_first_run = len(seen) == 0
-    print(f"[INFO] is_first_run={is_first_run}, items={len(items)}, seen_before={len(seen)}", flush=True)
+        is_first_run = len(seen) == 0
+        print(f"[INFO] is_first_run={is_first_run}, items={len(items)}, seen_before={len(seen)}", flush=True)
 
-    # タイトルのハッシュで新着判定
-    item_ids = {it["item_id"] for it in items}
-    new_ids = item_ids - seen
-    new_items = [it for it in items if it["item_id"] in new_ids]
+        # タイトルのハッシュで新着判定
+        item_ids = {it["item_id"] for it in items}
+        new_ids = item_ids - seen
+        new_items = [it for it in items if it["item_id"] in new_ids]
 
-    print(f"[INFO] Total items: {len(items)}, New items: {len(new_items)}", flush=True)
+        print(f"[INFO] Total items: {len(items)}, New items: {len(new_items)}", flush=True)
 
-    # 初回：基準登録のみ
-    if is_first_run:
-        print(f"[INFO] First run! Registering {len(items)} items as baseline.", flush=True)
-        for it in items:
-            seen.add(it["item_id"])
-        save_seen(seen)
-        send_text(f"✅ 産業能率大学ポータル監視を開始したで！\nこれから新着があったら通知するわ。")
-        print("=== MAIN END (first run) ===", flush=True)
-        return
+        # 初回：基準登録のみ
+        if is_first_run:
+            print(f"[INFO] First run! Registering {len(items)} items as baseline.", flush=True)
+            for it in items:
+                seen.add(it["item_id"])
+            save_seen(seen)
+            send_text(f"✅ 産業能率大学ポータル監視を開始したで！\nこれから新着があったら通知するわ。")
+            print("=== MAIN END (first run) ===", flush=True)
+            return
 
-    # 新着があれば通知
-    if new_items:
-        print(f"[INFO] Sending {len(new_items[:MAX_NOTIFY])} notifications...", flush=True)
-        for it in new_items[:MAX_NOTIFY]:
-            send_discord(it["title"], it["meta"], it["url"], it["is_new"])
-            seen.add(it["item_id"])
-        save_seen(seen)
-        print(f"=== MAIN END (notified {len(new_items[:MAX_NOTIFY])} items) ===", flush=True)
-    else:
-        print("[INFO] No new notices. Exiting quietly.", flush=True)
-        print("=== MAIN END (no changes) ===", flush=True)
+        # 新着があれば通知
+        if new_items:
+            print(f"[INFO] Sending {len(new_items[:MAX_NOTIFY])} notifications...", flush=True)
+            for it in new_items[:MAX_NOTIFY]:
+                send_discord(it["title"], it["meta"], it["url"], it["is_new"])
+                seen.add(it["item_id"])
+            save_seen(seen)
+            print(f"=== MAIN END (notified {len(new_items[:MAX_NOTIFY])} items) ===", flush=True)
+        else:
+            print("[INFO] No new notices. Exiting quietly.", flush=True)
+            print("=== MAIN END (no changes) ===", flush=True)
+
+    except Exception as e:
+        error_msg = f"❌ スクリプトが落ちたで！エラー: {str(e)[:200]}"
+        print(f"[FATAL] {error_msg}", flush=True)
+        send_text(error_msg)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
