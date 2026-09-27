@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v24
-- Ca-Inリンクはクリックせず、hrefを取得して直接page.goto()で遷移
-- タイムアウト対策
+sanno-portal-notify v25
+- 「お知らせ受信一覧」リンクも検索対象に追加
+- リンク見つからんかったら直接URLを推測して開く
 """
 
 import os
@@ -11,10 +11,11 @@ import json
 import sys
 import base64
 import subprocess
+import re
 from urllib.parse import urljoin
 
 print("=" * 50, flush=True)
-print("=== SCRIPT STARTED v24 ===", flush=True)
+print("=== SCRIPT STARTED v25 ===", flush=True)
 print("=" * 50, flush=True)
 
 from playwright.sync_api import sync_playwright
@@ -219,7 +220,7 @@ def scrape():
 
         print("[INFO] Portal page loaded successfully!", flush=True)
 
-        # --- 3. Ca-Inリンクのhrefを取得して直接遷移（v24変更点）---
+        # --- 3. Ca-Inリンクのhrefを取得して直接遷移 ---
         print("[INFO] Getting Ca-In link URL...", flush=True)
         cain_href = None
 
@@ -229,7 +230,6 @@ def scrape():
             print(f"[INFO] Found #cain href: {cain_href}", flush=True)
 
         if not cain_href:
-            # フォールバック: hrefにcamj_pcを含むリンクを探す
             for link in page.query_selector_all("a"):
                 href = link.get_attribute("href") or ""
                 if "camj_pc" in href:
@@ -239,16 +239,12 @@ def scrape():
 
         if not cain_href:
             print("[ERROR] Ca-In link not found!", flush=True)
-            if DEBUG:
-                page.screenshot(path="debug_error_no_cain.png", full_page=True)
             browser.close()
             sys.exit(3)
 
-        # 相対URLを絶対URLに変換
         cain_url = urljoin(page.url, cain_href)
         print(f"[INFO] Navigating directly to Ca-In: {cain_url}", flush=True)
 
-        # 直接遷移（クリックせず）
         page.goto(cain_url, wait_until="domcontentloaded", timeout=45000)
         page.wait_for_timeout(5000)
         print(f"[INFO] URL after Ca-In navigation: {page.url}", flush=True)
@@ -259,34 +255,55 @@ def scrape():
                 f.write(page.content())
             print("[DEBUG] Saved debug_04_cain.html/png", flush=True)
 
-        # --- 4. 「お知らせ」リンクを探す ---
+        # --- 4. 「お知らせ」リンクを探す（v25: より広く検索）---
         print("[INFO] Looking for notice link...", flush=True)
         notice_link = None
+        notice_href = None
 
+        # 方法1: セレクタで探す
         notice_selectors = [
+            'a:has-text("お知らせ受信一覧")',
             'a:has-text("お知らせ")',
             'a:has-text("大学からのお知らせ")',
             'a[href*="wbasmgjr"]',
+            'a[href*="WBASMGJR"]',
             'a[href*="notice"]',
         ]
 
         for sel in notice_selectors:
             if page.locator(sel).count() > 0:
                 notice_link = page.locator(sel).first
-                print(f"[INFO] Found notice link: {sel}", flush=True)
+                notice_href = notice_link.get_attribute("href")
+                print(f"[INFO] Found notice link by selector: {sel} -> {notice_href}", flush=True)
                 break
 
-        if notice_link:
-            print("[INFO] Clicking notice link...", flush=True)
-            try:
-                with page.expect_navigation(timeout=30000):
-                    notice_link.click()
-                page.wait_for_timeout(3000)
-                print(f"[INFO] URL after notice: {page.url}", flush=True)
-            except Exception as e:
-                print(f"[WARN] Notice click issue: {e}", flush=True)
-                page.wait_for_timeout(3000)
-                print(f"[INFO] URL after wait: {page.url}", flush=True)
+        # 方法2: 全リンクをスキャン（テキストで「お知らせ」を含むリンク）
+        if not notice_link:
+            print("[INFO] Scanning all links for notice...", flush=True)
+            for link in page.query_selector_all("a"):
+                txt = link.inner_text().strip()
+                href = link.get_attribute("href") or ""
+                if "お知らせ" in txt or "受信一覧" in txt:
+                    notice_link = link
+                    notice_href = href
+                    print(f"[INFO] Found notice link by text scan: '{txt}' -> {href}", flush=True)
+                    break
+
+        # 方法3: 直接URLを推測して開く
+        if not notice_href:
+            # top.do のURLから base URL を取得
+            base_url = page.url.replace("top.do", "")
+            guess_url = base_url + "campussquare.do?_flowId=WBASMGJRFlow"
+            print(f"[INFO] No notice link found. Guessing URL: {guess_url}", flush=True)
+            notice_href = guess_url
+
+        # お知らせページに遷移
+        if notice_href:
+            notice_url = urljoin(page.url, notice_href)
+            print(f"[INFO] Navigating to notice page: {notice_url}", flush=True)
+            page.goto(notice_url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(5000)
+            print(f"[INFO] URL after notice navigation: {page.url}", flush=True)
 
             if DEBUG:
                 page.screenshot(path="debug_05_notice.png", full_page=True)
