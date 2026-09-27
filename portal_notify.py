@@ -329,7 +329,7 @@ def main():
         for it in items:
             seen.add(it["url"])
         save_seen(seen)
-        send_text(f"✅ 産業能率大学ポータル監視を開始したで！（基準登録: {len(items)}件）\nこれから新着があったら通知するわ。")
+        send_text(f"✅ 産業能率大学ポータル監視を開始したで！\nこれから新着があったら通知するわ。")
         print("=== MAIN END (first run) ===", flush=True)
     else:
         # 新着判定
