@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sanno-portal-notify v25
-- 「お知らせ受信一覧」リンクも検索対象に追加
-- リンク見つからんかったら直接URLを推測して開く
+sanno-portal-notify v27
+- 「お知らせ」タブをJavaScriptでクリック
+- 表示件数を200件に変更して1ページで全件取得
+- テーブル構造に合わせて抽出ロジック修正
 """
 
 import os
@@ -11,11 +12,10 @@ import json
 import sys
 import base64
 import subprocess
-import re
 from urllib.parse import urljoin
 
 print("=" * 50, flush=True)
-print("=== SCRIPT STARTED v25 ===", flush=True)
+print("=== SCRIPT STARTED v27 ===", flush=True)
 print("=" * 50, flush=True)
 
 from playwright.sync_api import sync_playwright
@@ -116,51 +116,89 @@ def save_seen(seen_set):
         print(f"[WARN] save_seen failed: {e}", flush=True)
 
 
-# ===== お知らせ抽出 =====
+# ===== お知らせ抽出（v27: HTML構造に合わせて修正） =====
 def extract_notices(page):
     items = []
-    rows = page.query_selector_all("table tbody tr, table tr")
-    print(f"[INFO] Found {len(rows)} table rows", flush=True)
 
-    for row in rows:
-        title_cell = row.query_selector(".camjnext-list-item-contents")
-        if not title_cell:
-            continue
+    # 方法1: .camjnext-list-item-contents から直接探す
+    contents = page.query_selector_all(".camjnext-list-item-contents")
+    print(f"[INFO] Found {len(contents)} .camjnext-list-item-contents elements", flush=True)
 
-        link = title_cell.query_selector("a")
-        if not link:
-            continue
+    for content in contents:
+        try:
+            # タイトルリンク
+            link = content.query_selector("a")
+            if not link:
+                continue
 
-        title = link.inner_text().strip()
-        if not title or len(title) < 3:
-            continue
+            title = link.inner_text().strip()
+            if not title or len(title) < 3:
+                continue
 
-        href = link.get_attribute("href")
-        if href:
-            item_url = urljoin(page.url, href)
-        else:
+            # onclickからIDを抽出（selectMsgr(0) → 個別URL生成用）
+            onclick = link.get_attribute("onclick") or ""
+            # URLは直接取れんから、ページURLをベースにする
             item_url = page.url
 
-        tds = row.query_selector_all("td")
-        date_str = tds[3].inner_text().strip() if len(tds) > 3 else ""
-        sender = tds[4].inner_text().strip() if len(tds) > 4 else ""
-        category = tds[5].inner_text().strip() if len(tds) > 5 else ""
+            # NEWタグ
+            new_tag = content.query_selector(".camjnext-list-tag-new")
+            is_new = new_tag is not None
 
-        new_tag = title_cell.query_selector(".camjnext-list-tag-new")
-        is_new = new_tag is not None
+            # 親のtr/tdから日付・送信者・カテゴリを探す
+            parent = content.evaluate("el => el.closest('tr')?.innerText || el.closest('td')?.innerText || ''") or ""
+            meta = ""
+            if parent:
+                # 親要素のテキストからメタ情報を抽出
+                lines = [l.strip() for l in parent.split("\n") if l.strip() and l.strip() != title]
+                if len(lines) >= 3:
+                    meta = " / ".join(lines[-3:])  # 最後の3要素をメタとして使う
 
-        meta_parts = [p for p in [date_str, sender, category] if p]
-        meta = " / ".join(meta_parts)
-        if is_new:
-            meta += " / 【NEW】"
+            if is_new:
+                meta += " / 【NEW】" if meta else "【NEW】"
 
-        items.append({
-            "title": title[:200],
-            "meta": meta,
-            "url": item_url,
-            "is_new": is_new
-        })
+            items.append({
+                "title": title[:200],
+                "meta": meta,
+                "url": item_url,
+                "is_new": is_new
+            })
+        except Exception as e:
+            print(f"[WARN] Extract error: {e}", flush=True)
+            continue
 
+    if items:
+        print(f"[INFO] Method 1 succeeded: {len(items)} items", flush=True)
+        return items
+
+    # 方法2: 全リンクをスキャン（フォールバック）
+    print(f"[INFO] Method 1 failed. Trying Method 2...", flush=True)
+    all_links = page.query_selector_all("a")
+    seen_titles = set()
+
+    for link in all_links:
+        try:
+            onclick = link.get_attribute("onclick") or ""
+            if "selectMsgr" not in onclick:
+                continue
+
+            title = link.inner_text().strip()
+            if not title or title in seen_titles or len(title) < 3:
+                continue
+            seen_titles.add(title)
+
+            parent = link.evaluate("el => el.parentElement?.innerText || ''") or ""
+            is_new = "NEW" in parent
+
+            items.append({
+                "title": title[:200],
+                "meta": "【NEW】" if is_new else "",
+                "url": page.url,
+                "is_new": is_new
+            })
+        except:
+            continue
+
+    print(f"[INFO] Method 2 result: {len(items)} items", flush=True)
     return items
 
 
@@ -187,40 +225,13 @@ def scrape():
         # --- 1. ポータルページにアクセス ---
         print(f"[INFO] Opening {PORTAL_URL}", flush=True)
         page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=45000)
-        print(f"[INFO] URL after goto: {page.url}", flush=True)
-
-        print("[INFO] Waiting 5 seconds for page to settle...", flush=True)
         page.wait_for_timeout(5000)
-        print(f"[INFO] URL after wait: {page.url}", flush=True)
-
-        html = page.content()
-        print(f"[DEBUG] Page HTML length: {len(html)} chars", flush=True)
-
-        body_text = page.locator("body").inner_text() or ""
-        print(f"[DEBUG] Body text length: {len(body_text)} chars", flush=True)
+        print(f"[INFO] URL after portal: {page.url}", flush=True)
 
         if DEBUG:
             page.screenshot(path="debug_01_portal.png", full_page=True)
-            with open("debug_01_portal.html", "w", encoding="utf-8") as f:
-                f.write(html)
-            print("[DEBUG] Saved debug_01_portal.html/png", flush=True)
 
-        # --- 2. ページ診断 ---
-        print("[INFO] Diagnosing page state...", flush=True)
-        has_cain = page.locator("#cain").count() > 0
-        has_student_id = SANNO_ID in body_text
-        link_count = len(page.query_selector_all("a"))
-
-        print(f"[INFO] has_cain={has_cain}, has_student_id={has_student_id}, links={link_count}", flush=True)
-
-        if not has_cain and not has_student_id:
-            print("[ERROR] Failed to enter portal page after Basic auth.", flush=True)
-            browser.close()
-            sys.exit(2)
-
-        print("[INFO] Portal page loaded successfully!", flush=True)
-
-        # --- 3. Ca-Inリンクのhrefを取得して直接遷移 ---
+        # --- 2. Ca-Inリンクのhrefを取得して直接遷移 ---
         print("[INFO] Getting Ca-In link URL...", flush=True)
         cain_href = None
 
@@ -243,11 +254,11 @@ def scrape():
             sys.exit(3)
 
         cain_url = urljoin(page.url, cain_href)
-        print(f"[INFO] Navigating directly to Ca-In: {cain_url}", flush=True)
+        print(f"[INFO] Navigating to Ca-In: {cain_url}", flush=True)
 
         page.goto(cain_url, wait_until="domcontentloaded", timeout=45000)
         page.wait_for_timeout(5000)
-        print(f"[INFO] URL after Ca-In navigation: {page.url}", flush=True)
+        print(f"[INFO] URL after Ca-In: {page.url}", flush=True)
 
         if DEBUG:
             page.screenshot(path="debug_04_cain.png", full_page=True)
@@ -255,94 +266,58 @@ def scrape():
                 f.write(page.content())
             print("[DEBUG] Saved debug_04_cain.html/png", flush=True)
 
-        # --- 4. 「お知らせ」リンクを探す（v25: より広く検索）---
-        print("[INFO] Looking for notice link...", flush=True)
-        notice_link = None
-        notice_href = None
+        # --- 3. 「お知らせ」タブをJavaScriptでクリック（v27最重要）---
+        print("[INFO] Clicking 'お知らせ' tab via JavaScript...", flush=True)
+        try:
+            page.evaluate("""() => {
+                if (typeof searchMgsrIcon === 'function') {
+                    searchMgsrIcon('03');
+                } else {
+                    // searchMgsrIconが見つからん場合は、テキストで探してクリック
+                    var links = document.querySelectorAll('a');
+                    for (var i = 0; i < links.length; i++) {
+                        if (links[i].innerText.includes('お知らせ')) {
+                            links[i].click();
+                            break;
+                        }
+                    }
+                }
+            }""")
+            page.wait_for_timeout(3000)
+            print(f"[INFO] URL after clicking お知らせ tab: {page.url}", flush=True)
+        except Exception as e:
+            print(f"[WARN] Tab click error: {e}", flush=True)
 
-        # 方法1: セレクタで探す
-        notice_selectors = [
-            'a:has-text("お知らせ受信一覧")',
-            'a:has-text("お知らせ")',
-            'a:has-text("大学からのお知らせ")',
-            'a[href*="wbasmgjr"]',
-            'a[href*="WBASMGJR"]',
-            'a[href*="notice"]',
-        ]
+        # --- 4. 表示件数を200件に変更（v27最重要）---
+        print("[INFO] Changing display count to 200...", flush=True)
+        try:
+            select = page.query_selector("select[name='maxDispListCount']")
+            if select:
+                select.select_option("200")
+                page.wait_for_timeout(3000)
+                print(f"[INFO] Changed to 200 items display", flush=True)
+            else:
+                print(f"[WARN] Select not found, trying JavaScript...", flush=True)
+                page.evaluate("""() => {
+                    var select = document.querySelector("select[name='maxDispListCount']");
+                    if (select) {
+                        select.value = "200";
+                        select.dispatchEvent(new Event('change'));
+                    }
+                }""")
+                page.wait_for_timeout(3000)
+        except Exception as e:
+            print(f"[WARN] Display count change error: {e}", flush=True)
 
-        for sel in notice_selectors:
-            if page.locator(sel).count() > 0:
-                notice_link = page.locator(sel).first
-                notice_href = notice_link.get_attribute("href")
-                print(f"[INFO] Found notice link by selector: {sel} -> {notice_href}", flush=True)
-                break
-
-        # 方法2: 全リンクをスキャン（テキストで「お知らせ」を含むリンク）
-        if not notice_link:
-            print("[INFO] Scanning all links for notice...", flush=True)
-            for link in page.query_selector_all("a"):
-                txt = link.inner_text().strip()
-                href = link.get_attribute("href") or ""
-                if "お知らせ" in txt or "受信一覧" in txt:
-                    notice_link = link
-                    notice_href = href
-                    print(f"[INFO] Found notice link by text scan: '{txt}' -> {href}", flush=True)
-                    break
-
-        # 方法3: 直接URLを推測して開く
-        if not notice_href:
-            # top.do のURLから base URL を取得
-            base_url = page.url.replace("top.do", "")
-            guess_url = base_url + "campussquare.do?_flowId=WBASMGJRFlow"
-            print(f"[INFO] No notice link found. Guessing URL: {guess_url}", flush=True)
-            notice_href = guess_url
-
-        # お知らせページに遷移
-        if notice_href:
-            notice_url = urljoin(page.url, notice_href)
-            print(f"[INFO] Navigating to notice page: {notice_url}", flush=True)
-            page.goto(notice_url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(5000)
-            print(f"[INFO] URL after notice navigation: {page.url}", flush=True)
-
-            if DEBUG:
-                page.screenshot(path="debug_05_notice.png", full_page=True)
-                with open("debug_05_notice.html", "w", encoding="utf-8") as f:
-                    f.write(page.content())
-                print("[DEBUG] Saved debug_05_notice.html/png", flush=True)
+        if DEBUG:
+            page.screenshot(path="debug_05_notice.png", full_page=True)
+            with open("debug_05_notice.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+            print("[DEBUG] Saved debug_05_notice.html/png", flush=True)
 
         # --- 5. お知らせ抽出 ---
         items = extract_notices(page)
         print(f"[INFO] Extracted {len(items)} notices", flush=True)
-
-        # ページネーション
-        page_num = 1
-        while len(items) < 90 and page_num < 10:
-            next_btn = None
-            for link in page.query_selector_all("a"):
-                txt = link.inner_text().strip()
-                if txt in (">", "›", "→", "次へ", "Next"):
-                    cls = link.get_attribute("class") or ""
-                    if "disabled" not in cls and "inactive" not in cls:
-                        next_btn = link
-                        break
-
-            if not next_btn:
-                break
-
-            try:
-                print(f"[INFO] Clicking next page ({page_num + 1})...", flush=True)
-                next_btn.click()
-                page.wait_for_timeout(3000)
-                page_num += 1
-                new_items = extract_notices(page)
-                existing_urls = {it["url"] for it in items}
-                for it in new_items:
-                    if it["url"] not in existing_urls:
-                        items.append(it)
-            except Exception as e:
-                print(f"[WARN] Pagination error: {e}", flush=True)
-                break
 
         browser.close()
         print(f"=== SCRAPE DONE: {len(items)} items ===", flush=True)
