@@ -126,7 +126,7 @@ def send_text(text):
                     time.sleep(2 ** attempt)
 
 
-def send_summary_embed(count, items, list_url):
+def send_summary_embed(count, items):
     """新着が3件以上ある時、まとめて1つのEmbedにする"""
     lines = []
     for i, it in enumerate(items[:10], 1):
@@ -135,7 +135,7 @@ def send_summary_embed(count, items, list_url):
             emoji = TAG_EMOJI[it["tag"]]
         elif it["is_new"]:
             emoji = "🆕"
-        lines.append(f"{i}. [{it['title'][:80]}]({list_url}) {emoji}")
+        lines.append(f"{i}. [{it['title'][:80]}]({it['url']}) {emoji}")
 
     if len(items) > 10:
         lines.append(f"\n...他 {len(items) - 10} 件")
@@ -143,7 +143,7 @@ def send_summary_embed(count, items, list_url):
     description = "\n".join(lines)
     embed = {
         "title": f"📢 新着お知らせ {count}件",
-        "url": list_url,
+        "url": items[0]["url"] if items else PORTAL_URL,
         "color": 0x00C853,
         "description": description,
         "footer": {"text": "産業能率大学ポータル"}
@@ -248,11 +248,13 @@ def extract_notices(page, list_url):
 
             # ユニークIDはタイトルのハッシュ
             item_id = hashlib.md5(title.encode()).hexdigest()[:16]
+            href = link.get_attribute("href") or ""
+            notice_url = urljoin(page.url, href) if href and not href.lower().startswith("javascript:") else list_url
 
             items.append({
                 "title": title[:200],
                 "meta": meta,
-                "url": list_url,
+                "url": notice_url,
                 "item_id": item_id,
                 "is_new": is_new,
                 "tag": tag,
@@ -449,7 +451,7 @@ def main():
 
             # 3件以上ならまとめ通知、2件以下は個別通知
             if notify_count >= 3:
-                send_summary_embed(notify_count, new_items[:MAX_NOTIFY], items[0]["url"] if items else PORTAL_URL)
+                send_summary_embed(notify_count, new_items[:MAX_NOTIFY])
             else:
                 for it in new_items[:MAX_NOTIFY]:
                     send_discord(it["title"], it["meta"], it["url"], it["is_new"], it.get("tag", ""))
