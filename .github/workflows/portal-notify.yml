@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
+    inputs:
+      send_test:
+        description: "Send a Discord test notification"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -41,6 +47,7 @@ jobs:
           SANNO_ID: ${{ secrets.SANNO_ID }}
           SANNO_PASS: ${{ secrets.SANNO_PASS }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          TEST_DISCORD: ${{ inputs.send_test || false }}
           DEBUG: "false"
         run: |
           echo "=== ファイル確認 ==="

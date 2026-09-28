@@ -34,6 +34,7 @@ DEBUG = os.environ.get("DEBUG", "0") == "1"
 SANNO_ID = os.environ.get("SANNO_ID", "").strip()
 SANNO_PASS = os.environ.get("SANNO_PASS", "").strip()
 DISCORD_WEBHOOKS = [w.strip() for w in os.environ.get("DISCORD_WEBHOOK", "").split(",") if w.strip()]
+TEST_DISCORD = os.environ.get("TEST_DISCORD", "").lower() == "true"
 FILTER_KEYWORD = os.environ.get("FILTER_KEYWORD", "").strip()
 MAX_NOTIFY = int(os.environ.get("MAX_NOTIFY_PER_RUN", "20"))
 
@@ -416,6 +417,10 @@ def main():
         sys.exit(1)
 
     try:
+        if TEST_DISCORD:
+            send_text("SANNOポータル通知のテスト通知です。Discord Webhook は正常に設定されています。")
+            print("[INFO] Test Discord notification sent.", flush=True)
+
         seen = load_seen()
         items = scrape()
 
