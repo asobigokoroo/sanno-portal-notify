@@ -2,7 +2,7 @@ name: SANNOポータル通知
 
 on:
   schedule:
-    - cron: "5,35 8-22 * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 permissions:
