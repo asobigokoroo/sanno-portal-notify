@@ -16,20 +16,18 @@ import base64
 import subprocess
 import hashlib
 import time
+from datetime import datetime, timezone
 from urllib.parse import urljoin
-
-print("=" * 50, flush=True)
-print("=== SCRIPT STARTED v31 ===", flush=True)
-print("=" * 50, flush=True)
 
 from playwright.sync_api import sync_playwright
 
-print("=== IMPORT OK ===", flush=True)
-
-# ===== 設定 =====
 PORTAL_URL = "https://signweb.mi.sanno.ac.jp/portal/"
 SEEN_FILE = "seen.json"
 DEBUG = os.environ.get("DEBUG", "0") == "1"
+DISCORD_TIMEOUT = 15
+DISCORD_RETRIES = 3
+DISCORD_SUCCESS_CODES = {"200", "201", "204"}
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 SANNO_ID = os.environ.get("SANNO_ID", "").strip()
 SANNO_PASS = os.environ.get("SANNO_PASS", "").strip()
@@ -37,11 +35,6 @@ DISCORD_WEBHOOKS = [w.strip() for w in os.environ.get("DISCORD_WEBHOOK", "").spl
 FILTER_KEYWORD = os.environ.get("FILTER_KEYWORD", "").strip()
 MAX_NOTIFY = int(os.environ.get("MAX_NOTIFY_PER_RUN", "20"))
 
-print(f"DEBUG={DEBUG}, ID={'set' if SANNO_ID else 'EMPTY'}, PASS={'set' if SANNO_PASS else 'EMPTY'}, WEBHOOKS={len(DISCORD_WEBHOOKS)}", flush=True)
-for i, wh in enumerate(DISCORD_WEBHOOKS):
-    print(f"  WEBHOOK[{i}]={wh[:50]}...", flush=True)
-
-# ===== タグ色分け設定 =====
 TAG_COLORS = {
     "重要": 0xFF0000,   # 赤
     "休講": 0xFF8800,   # オレンジ
@@ -53,9 +46,50 @@ TAG_EMOJI = {
     "注目": "👀",
 }
 
-# ===== Discord送信（curl版・Cloudflare対策・リトライ付き） =====
+
+def send_webhook(payload, message_type):
+    """Send one payload to every configured webhook with retries."""
+    payload_json = json.dumps(payload, ensure_ascii=False)
+    headers = [
+        "-H", "Content-Type: application/json",
+        "-H", f"User-Agent: {USER_AGENT}",
+    ]
+    for wh in DISCORD_WEBHOOKS:
+        for attempt in range(DISCORD_RETRIES):
+            try:
+                cmd = [
+                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                    *headers,
+                    "-d", payload_json,
+                    wh
+                ]
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=DISCORD_TIMEOUT
+                )
+                status = result.stdout.strip()
+                if status in DISCORD_SUCCESS_CODES:
+                    print(
+                        f"[OK] Discord {message_type} sent: status={status}",
+                        flush=True,
+                    )
+                    break
+                print(
+                    f"[WARN] Unexpected status: {status}, "
+                    f"retrying ({attempt + 1}/{DISCORD_RETRIES})...",
+                    flush=True,
+                )
+            except Exception as e:
+                print(
+                    f"[NG] Discord {message_type} failed "
+                    f"(attempt {attempt + 1}/{DISCORD_RETRIES}): {e}",
+                    flush=True,
+                )
+            if attempt < DISCORD_RETRIES - 1:
+                time.sleep(2 ** attempt)
+
+
 def send_discord(title, meta, url, is_new=False, tag=""):
-    if tag and tag in TAG_COLORS:
+    if tag in TAG_COLORS:
         color = TAG_COLORS[tag]
     elif is_new:
         color = 0x00C853
@@ -66,64 +100,17 @@ def send_discord(title, meta, url, is_new=False, tag=""):
         "title": title[:250] or "(無題)",
         "url": url,
         "color": color,
-        "footer": {"text": "産業能率大学ポータル"}
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "footer": {"text": "産業能率大学ポータル"},
     }
     if meta:
         embed["description"] = meta[:500]
 
-    payload_json = json.dumps({"embeds": [embed]}, ensure_ascii=False)
-
-    for wh in DISCORD_WEBHOOKS:
-        for attempt in range(3):
-            try:
-                cmd = [
-                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                    "-H", "Content-Type: application/json",
-                    "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "-d", payload_json,
-                    wh
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-                status = result.stdout.strip()
-                if status in ("200", "201", "204"):
-                    print(f"[OK] Discord embed sent: status={status}", flush=True)
-                    break
-                else:
-                    print(f"[WARN] Unexpected status: {status}, retrying ({attempt+1}/3)...", flush=True)
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
-            except Exception as e:
-                print(f"[NG] Discord failed (attempt {attempt+1}/3): {e}", flush=True)
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
+    send_webhook({"embeds": [embed]}, "embed")
 
 
 def send_text(text):
-    payload_json = json.dumps({"content": text}, ensure_ascii=False)
-
-    for wh in DISCORD_WEBHOOKS:
-        for attempt in range(3):
-            try:
-                cmd = [
-                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                    "-H", "Content-Type: application/json",
-                    "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "-d", payload_json,
-                    wh
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-                status = result.stdout.strip()
-                if status in ("200", "201", "204"):
-                    print(f"[OK] Discord text sent: status={status}", flush=True)
-                    break
-                else:
-                    print(f"[WARN] Unexpected status: {status}, retrying ({attempt+1}/3)...", flush=True)
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
-            except Exception as e:
-                print(f"[NG] Discord failed (attempt {attempt+1}/3): {e}", flush=True)
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
+    send_webhook({"content": text}, "text")
 
 
 def send_summary_embed(count, items):
@@ -146,34 +133,11 @@ def send_summary_embed(count, items):
         "url": items[0]["url"] if items else PORTAL_URL,
         "color": 0x00C853,
         "description": description,
-        "footer": {"text": "産業能率大学ポータル"}
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "footer": {"text": "産業能率大学ポータル"},
     }
 
-    payload_json = json.dumps({"embeds": [embed]}, ensure_ascii=False)
-
-    for wh in DISCORD_WEBHOOKS:
-        for attempt in range(3):
-            try:
-                cmd = [
-                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                    "-H", "Content-Type: application/json",
-                    "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "-d", payload_json,
-                    wh
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-                status = result.stdout.strip()
-                if status in ("200", "201", "204"):
-                    print(f"[OK] Discord summary sent: status={status}", flush=True)
-                    break
-                else:
-                    print(f"[WARN] Unexpected status: {status}, retrying ({attempt+1}/3)...", flush=True)
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
-            except Exception as e:
-                print(f"[NG] Discord summary failed (attempt {attempt+1}/3): {e}", flush=True)
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
+    send_webhook({"embeds": [embed]}, "summary")
 
 
 # ===== seen.json（タイトルベース管理） =====
@@ -398,7 +362,8 @@ def scrape():
                                 added += 1
                         print(f"[INFO] Page {page_num}: added {added} items (total: {len(all_items)})", flush=True)
                         break
-                except:
+                except Exception as e:
+                    print(f"[WARN] Pagination error: {e}", flush=True)
                     continue
 
             if not next_found:
