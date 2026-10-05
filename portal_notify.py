@@ -13,10 +13,11 @@ import os
 import json
 import sys
 import base64
+import re
 import subprocess
 import hashlib
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 print("=" * 50, flush=True)
 print("=== SCRIPT STARTED v31 ===", flush=True)
@@ -202,6 +203,41 @@ def save_seen(seen_set):
 
 
 # ===== お知らせ抽出 =====
+DETAIL_PATH_RE = re.compile(
+    r"(?:https?://[^\s\"'()]+|/?[A-Za-z0-9_-]+\.do(?:\?[^\s\"'()]*)?)",
+    re.IGNORECASE,
+)
+
+
+def resolve_notice_url(page, link, content, list_url):
+    """一覧リンクからお知らせ詳細URLを解決する。"""
+    href = link.get_attribute("href") or ""
+    if href and not href.lower().startswith("javascript:") and href != "#":
+        direct_url = urljoin(page.url, href)
+        parsed = urlparse(direct_url)
+        if not (parsed.path.lower().endswith("/top.do") and parsed.fragment):
+            return direct_url
+
+    attributes = [
+        link.get_attribute("onclick") or "",
+        content.get_attribute("onclick") or "",
+        content.evaluate(
+            "el => { const form = el.closest('form'); return form ? form.action : ''; }"
+        ) or "",
+        page.evaluate(
+            "() => typeof selectMsgr === 'function' ? selectMsgr.toString() : ''"
+        ) or "",
+    ]
+    for attribute in attributes:
+        for candidate in DETAIL_PATH_RE.findall(attribute):
+            candidate_url = urljoin(page.url, candidate)
+            if urlparse(candidate_url).path.lower().endswith("/top.do"):
+                continue
+            return candidate_url
+
+    return list_url
+
+
 def extract_notices(page, list_url):
     items = []
     contents = page.query_selector_all(".camjnext-list-item-contents")
@@ -248,8 +284,7 @@ def extract_notices(page, list_url):
 
             # ユニークIDはタイトルのハッシュ
             item_id = hashlib.md5(title.encode()).hexdigest()[:16]
-            href = link.get_attribute("href") or ""
-            notice_url = urljoin(page.url, href) if href and not href.lower().startswith("javascript:") else list_url
+            notice_url = resolve_notice_url(page, link, content, list_url)
 
             items.append({
                 "title": title[:200],
