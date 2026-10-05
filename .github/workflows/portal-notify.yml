@@ -2,7 +2,7 @@ name: SANNOポータル通知
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0,30 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -41,7 +41,7 @@ jobs:
           SANNO_ID: ${{ secrets.SANNO_ID }}
           SANNO_PASS: ${{ secrets.SANNO_PASS }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          DEBUG: "false"
+          DEBUG: "0"
         run: |
           echo "=== ファイル確認 ==="
           ls -la portal_notify.py
