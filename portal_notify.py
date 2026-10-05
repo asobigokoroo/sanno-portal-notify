@@ -16,6 +16,7 @@ import base64
 import subprocess
 import hashlib
 import time
+from datetime import datetime, timezone
 from urllib.parse import urljoin
 
 from playwright.sync_api import sync_playwright
@@ -99,6 +100,7 @@ def send_discord(title, meta, url, is_new=False, tag=""):
         "title": title[:250] or "(無題)",
         "url": url,
         "color": color,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "footer": {"text": "産業能率大学ポータル"},
     }
     if meta:
@@ -131,6 +133,7 @@ def send_summary_embed(count, items):
         "url": items[0]["url"] if items else PORTAL_URL,
         "color": 0x00C853,
         "description": description,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "footer": {"text": "産業能率大学ポータル"},
     }
 
